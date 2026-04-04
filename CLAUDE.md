@@ -37,6 +37,28 @@ problem_name/
 └── explanation.md (detailed walkthrough)
 ```
 
+#### `/system-design/` - Infrastructure and backend system design
+Large-scale distributed systems and infrastructure design questions.
+
+- Social media platforms (Twitter, Instagram, TikTok)
+- File sharing systems (Google Drive, Dropbox)
+- Video streaming (YouTube, Netflix)
+- Ride-sharing (Uber, Lyft)
+- URL shortening services
+- Real-time messaging systems
+- Search engines and indexing
+- Load balancing and caching strategies
+
+**Structure for each design:**
+```
+system_name/
+├── design.md (high-level design and requirements)
+├── architecture.md (detailed system architecture)
+├── database_design.md (data models and schema)
+├── template.py (starter template with boilerplate)
+└── tradeoffs.md (design tradeoffs and considerations)
+```
+
 #### `/ml-system-design/` - Large-scale ML system design
 System design questions focused on building production ML systems.
 
@@ -45,6 +67,7 @@ System design questions focused on building production ML systems.
 - Search/retrieval systems
 - Real-time prediction systems
 - Model serving & inference
+- Feature stores and data pipelines
 
 **Structure for each design:**
 ```
@@ -170,6 +193,7 @@ Each problem folder includes a `template.py` file with:
 - **Solution/Model Class**: Template class where implementation goes
   - **ML Coding**: `Solution` class with `fit()` and `predict()` methods
   - **System Design**: `SystemDesign` class with design methods
+  - **Infrastructure System Design**: `SystemArchitecture` class with design methods
   - **Probability**: `Solver` class with `analyze()` and `solve()` methods
   - **ML Theory**: `Implementation` class with `compute()` method
   - **Reinforcement Learning**: `Agent` class with `act()` and `learn()` methods
