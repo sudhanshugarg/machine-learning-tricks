@@ -247,6 +247,525 @@ Where f() is empirically derived from:
 
 **Recommendation**: Use **Option 1** for initial implementation (realistic), then **Option 2** for optimization (learning optimal pricing).
 
+### Using Cancellations & Acceptance Rates in Training
+
+**Key Question**: Should we only train on accepted rides? How do cancellations inform surge pricing?
+
+#### Understanding the Selection Bias Problem
+
+**Naive Approach (WRONG):**
+```
+Only use accepted rides for training:
+  Input:  [active_requests, available_drivers, ...]
+  Output: surge_multiplier (from accepted rides only)
+
+Problem: Selection Bias
+  - If surge is very high (3.0x), many users cancel → fewer "accepted" rides
+  - Model never sees that high surge caused cancellations
+  - When surge is high and user cancels, we lose that data point
+  - Model becomes biased toward lower surge values
+  - Underpredicts surge in high-demand scenarios
+```
+
+**Example scenario:**
+```
+Zone A at 8pm:
+  - 200 active requests, 30 drivers
+  - Company charged 2.5x surge
+  - 50% users cancelled (too expensive)
+  - 100 users accepted
+
+If we only use the 100 accepted rides:
+  ✗ We lose signal that 2.5x caused 50% cancellations
+  ✗ Model thinks 2.5x is a good surge for this demand level
+  ✗ Later when demand similar, model predicts 2.5x
+  ✗ We get high cancellation rate again
+
+Correct approach:
+  ✓ Use ALL 200 requests (accepted + cancelled)
+  ✓ Label all with same surge (2.5x)
+  ✓ Model learns: 2.5x caused cancellations
+  ✓ Can use cancellation rate as secondary signal
+```
+
+#### How to Handle Rides in Training
+
+**1. Include ALL Rides (Accepted & Cancelled) for Label Generation:**
+
+```python
+def generate_surge_labels(zone_data_at_time_t):
+    """
+    Generate label using ALL rides, not just accepted ones
+    """
+
+    # zone_data_at_time_t contains:
+    # - All active requests (some accepted, some cancelled)
+    # - Actual price charged
+    # - Base price estimate
+    # - Cancellation rate
+
+    # Label is the same for all rides in this zone-time:
+    # It reflects what surge multiplier the company actually charged
+
+    actual_prices = zone_data['price_charged']
+    base_prices = zone_data['estimated_base_price']
+
+    # Calculate surge from mean price
+    surge_multiplier = mean(actual_prices) / mean(base_prices)
+
+    # This surge applies to ALL requests (accepted and cancelled)
+    # Cancellations inform us that this surge may have been too high
+
+    return surge_multiplier
+```
+
+**Why this works:**
+- Non-cancelled users → generate revenue at that surge price
+- Cancelled users → indicate price sensitivity / surge too high
+- Together they tell complete story: "this surge caused X% cancellation"
+- Model learns optimal surge (balancing revenue vs. acceptability)
+
+**2. Use Cancellation Rate as a Feature:**
+
+```python
+# Features for surge model include:
+features = {
+    'active_requests': 200,
+    'available_drivers': 30,
+    'requests_per_driver': 6.67,
+    'hour': 20,
+    'weather': 'clear',
+    ...
+    'recent_cancellation_rate': 0.35,  # ← Add this!
+}
+
+# If surge was too high → high cancellation_rate
+# Model learns this feedback signal
+```
+
+**How to calculate cancellation_rate feature:**
+
+```python
+# For each zone-time window (e.g., last 10 minutes):
+requests_made = 200
+requests_cancelled = 70
+requests_accepted = 130
+
+cancellation_rate = requests_cancelled / requests_made  # 0.35 (35%)
+
+# This becomes a feature in the next prediction cycle
+# High cancellation_rate → indicate previous surge was too aggressive
+```
+
+#### Three Approaches to Using Cancellations
+
+**Approach 1: Simple - Include cancellation_rate as Feature**
+
+```
+Pros:
+  ✓ Simple to implement
+  ✓ Model learns correlation: high surge → high cancellation
+  ✓ Feedback loop: surge causes cancellation → cancellation informs next surge
+  ✓ Works with existing label generation
+
+Cons:
+  ✗ Indirect signal (cancellation in t-10min informs surge at t)
+  ✗ Lag between cause (surge) and feedback (cancellation rate)
+
+Implementation:
+  features['recent_cancellation_rate'] = moving_avg_cancellation_rate[-10min]
+  # When training, include this feature
+  # Model learns: high cancellation_rate → reduce next surge prediction
+```
+
+**Approach 2: Moderate - Decompose Acceptance Impact**
+
+Key idea: Use offline revenue analysis to create optimal labels instead of actual surge.
+
+#### Label Generation Process
+
+**Step 1: Stratify by Demand Level**
+
+```python
+# Group historical data by demand bins
+# Use requests_per_driver as the demand signal
+demand_bins = [
+    (0, 0.5),      # Low demand
+    (0.5, 1.5),    # Medium demand
+    (1.5, 3.0),    # High demand
+    (3.0, 5.0),    # Very high demand
+    (5.0, float('inf'))  # Extreme demand
+]
+
+for demand_min, demand_max in demand_bins:
+    demand_slice = historical_data[
+        (historical_data['requests_per_driver'] >= demand_min) &
+        (historical_data['requests_per_driver'] < demand_max)
+    ]
+
+    # Continue to Step 2 for each demand bin
+```
+
+**Step 2: Measure Acceptance Curves**
+
+```python
+def analyze_surge_acceptance_curve(demand_slice):
+    """
+    For a given demand level, measure how cancellation_rate varies by surge
+    """
+
+    # Group by surge levels actually used in history
+    surge_groups = demand_slice.groupby(
+        pd.cut(demand_slice['surge_used'], bins=20)  # 20 surge bins
+    )
+
+    results = []
+
+    for surge_bin, group in surge_groups:
+        surge_val = surge_bin.mid
+
+        # Calculate metrics for this surge level
+        num_requests = len(group)
+        cancelled = group['cancelled'].sum()
+        cancellation_rate = cancelled / num_requests
+        acceptance_rate = 1 - cancellation_rate
+
+        # Revenue calculation
+        revenue_per_request = surge_val * acceptance_rate
+        total_revenue = revenue_per_request * num_requests
+
+        results.append({
+            'surge': surge_val,
+            'cancellation_rate': cancellation_rate,
+            'acceptance_rate': acceptance_rate,
+            'num_samples': num_requests,
+            'revenue_per_request': revenue_per_request,
+            'total_revenue': total_revenue
+        })
+
+    return pd.DataFrame(results)
+
+# Example output:
+# surge  | acceptance_rate | cancellation_rate | revenue_per_request
+# 1.0x   | 95%            | 5%               | 0.95
+# 1.2x   | 90%            | 10%              | 1.08
+# 1.5x   | 80%            | 20%              | 1.20  ← Peak!
+# 2.0x   | 50%            | 50%              | 1.00
+# 2.5x   | 30%            | 70%              | 0.75
+```
+
+**Step 3: Find Optimal Surge**
+
+```python
+def find_optimal_surge(acceptance_curve_df):
+    """
+    For this demand level, what surge maximizes revenue?
+    """
+
+    # Revenue = surge_multiplier × acceptance_rate
+    acceptance_curve_df['revenue'] = (
+        acceptance_curve_df['surge'] *
+        acceptance_curve_df['acceptance_rate']
+    )
+
+    # Find peak revenue
+    optimal_idx = acceptance_curve_df['revenue'].idxmax()
+    optimal_surge = acceptance_curve_df.loc[optimal_idx, 'surge']
+    peak_revenue = acceptance_curve_df.loc[optimal_idx, 'revenue']
+
+    return optimal_surge, peak_revenue
+```
+
+**Step 4: Create Label Lookup Table**
+
+```python
+# For each demand level, store optimal surge
+optimal_surge_lookup = {}
+
+for demand_min, demand_max in demand_bins:
+    demand_slice = get_demand_slice(demand_min, demand_max)
+    acceptance_curve = analyze_surge_acceptance_curve(demand_slice)
+    optimal_surge, peak_revenue = find_optimal_surge(acceptance_curve)
+
+    # Store for later use
+    demand_key = (demand_min, demand_max)
+    optimal_surge_lookup[demand_key] = {
+        'optimal_surge': optimal_surge,
+        'peak_revenue': peak_revenue,
+        'acceptance_curve': acceptance_curve
+    }
+
+# Example lookup:
+# (0, 0.5): {'optimal_surge': 1.0x, 'peak_revenue': 1.0}
+# (0.5, 1.5): {'optimal_surge': 1.2x, 'peak_revenue': 1.08}
+# (1.5, 3.0): {'optimal_surge': 1.5x, 'peak_revenue': 1.20}
+# (3.0, 5.0): {'optimal_surge': 1.4x, 'peak_revenue': 1.25}
+# (5.0, inf): {'optimal_surge': 1.3x, 'peak_revenue': 1.28}
+```
+
+**Step 5: Apply Optimal Labels to Training Data**
+
+```python
+def generate_optimal_labels(training_data, optimal_surge_lookup):
+    """
+    Assign optimal surge as label for each training sample
+    """
+
+    labels = []
+
+    for idx, row in training_data.iterrows():
+        requests_per_driver = row['requests_per_driver']
+
+        # Find which demand bin this falls into
+        for demand_min, demand_max in optimal_surge_lookup.keys():
+            if demand_min <= requests_per_driver < demand_max:
+                optimal_surge = optimal_surge_lookup[
+                    (demand_min, demand_max)
+                ]['optimal_surge']
+                break
+
+        labels.append(optimal_surge)
+
+    return np.array(labels)
+
+# Now train model with optimal labels:
+X_train, _ = training_data[feature_cols], training_data['surge_actual']
+y_train = generate_optimal_labels(training_data, optimal_surge_lookup)
+
+model.fit(X_train, y_train)  # Train on optimal surge, not actual surge!
+```
+
+#### Why This Works
+
+```
+Model learns: "For requests_per_driver=2.0, predict 1.5x (optimal)"
+Instead of: "For requests_per_driver=2.0, predict 2.5x (what was actually used)"
+
+Result:
+  - Model predicts revenue-maximizing surge
+  - Bypasses historical suboptimal pricing
+  - Converges faster (cleaner signal)
+  - Less noise from cancellation rate variations
+```
+
+#### Implementation Example
+
+```
+Training Sample:
+  zone: downtown
+  hour: 20
+  requests_per_driver: 2.3  ← Falls in (1.5, 3.0) bin
+  weather: rainy
+
+Approach 1 (Actual):
+  Label: 2.5x (whatever was charged)
+
+Approach 2 (Optimal):
+  Label: 1.5x (from optimal_surge_lookup[(1.5, 3.0)])
+
+Model trains on cleaner signal → predicts revenue-optimal surge
+```
+
+#### Pros & Cons
+
+```
+Pros:
+  ✓ Direct signal (no temporal lag like Approach 1)
+  ✓ Model learns revenue-optimal behavior
+  ✓ Bypasses historical suboptimal pricing
+  ✓ Faster convergence
+  ✓ Handles cancellations explicitly
+
+Cons:
+  ✗ Assumes historical data captures all surge-acceptance relationships
+  ✗ Requires offline analysis (extra step before training)
+  ✗ If acceptance curves change over time, labels become stale
+  ✗ May not work well for rare demand scenarios (low sample size)
+```
+
+**Approach 3: Advanced - Weighted Loss Function**
+
+```
+During training, weight samples by outcome using sample weights (must be non-negative):
+
+For accepted rides:
+  loss_weight = 1.0 (good outcome)
+  # Model should learn this surge level
+
+For cancelled rides:
+  loss_weight = 0.5 (lower weight, but still positive)
+  # Reduces influence but doesn't penalize gradients
+
+Better approach - use custom loss function instead:
+
+def surge_weighted_loss(y_true, y_pred, accepted_mask):
+    """
+    Custom loss that penalizes overpredicting surge on cancellations
+    """
+    base_loss = (y_true - y_pred) ** 2
+
+    # Scale loss based on outcome
+    weights = np.where(accepted_mask, 1.0, 2.0)  # Penalize cancelled rides more
+
+    return np.mean(weights * base_loss)
+
+Implementation with custom loss:
+  model.fit(X_train, y_train, loss=surge_weighted_loss,
+            loss_kwargs={'accepted_mask': accepted_mask})
+```
+
+#### Recommended Approach for Production
+
+**Hybrid: Approach 1 + 2**
+
+```
+Step 1: Train with all rides (accepted + cancelled)
+  - Label: actual surge charged (Option 1)
+  - Feature: include recent_cancellation_rate
+  - Model learns correlation between conditions and outcomes
+
+Step 2: Offline analysis - measure acceptance curves
+  For each demand level (requests_per_driver value):
+    - Find optimal surge that maximizes revenue
+    - Create lookup table: demand_level → optimal_surge
+
+Step 3: Use cancellation_rate for real-time adjustments
+  If recent_cancellation_rate > threshold (e.g., 40%):
+    - Reduce surge prediction by 10-20%
+    - More conservative pricing to improve experience
+    - Trade-off: slightly lower revenue for better retention
+
+Step 4: Monitor feedback loop
+  Every day measure:
+    - Cancellation rate vs. surge prediction correlation
+    - Revenue vs. user satisfaction
+    - Adjust weighting if needed
+```
+
+**Python Implementation:**
+
+```python
+def prepare_surge_training_data_with_cancellations(zone_metrics):
+    """
+    Include cancellations in training data
+    """
+
+    # 1. Load all requests (accepted + cancelled)
+    all_requests = load_all_zone_requests(zone_metrics)  # Don't filter!
+
+    # 2. Calculate labels using ALL rides
+    zone_times = all_requests.groupby(['zone_id', 'timestamp'])
+    labels = {}
+
+    for (zone, time), group in zone_times:
+        # Group contains both accepted and cancelled
+        actual_prices = group['price_charged']
+        base_prices = group['estimated_base_price']
+        cancellation_rate = group['cancelled'].mean()
+
+        surge = mean(actual_prices) / mean(base_prices)
+
+        labels[(zone, time)] = {
+            'surge_multiplier': surge,
+            'cancellation_rate': cancellation_rate,
+            'num_requests': len(group),
+            'num_cancelled': group['cancelled'].sum()
+        }
+
+    # 3. Engineer features including cancellation_rate
+    features = engineer_features(all_requests, labels)
+
+    # Add cancellation_rate from previous window as feature
+    features['recent_cancellation_rate'] = compute_recent_cancellation_rate(
+        all_requests, lookback_minutes=10
+    )
+
+    # 4. Create training labels (use actual surge, don't filter by acceptance)
+    X = features[feature_cols]
+    y = [labels[(z, t)]['surge_multiplier']
+         for z, t in zip(features['zone_id'], features['timestamp'])]
+
+    return X, y
+```
+
+#### Evaluating Model with Cancellation Metrics
+
+**During model evaluation, measure cancellation impact:**
+
+```python
+def evaluate_surge_with_cancellations(model, X_test, y_test, actual_cancellations):
+    """
+    Evaluate surge model considering cancellation outcomes
+    """
+
+    predictions = model.predict(X_test)
+
+    # Standard metrics
+    mape = mean_absolute_percentage_error(y_test, predictions)
+
+    # Cancellation-aware metrics
+    predicted_vs_actual_cancellation = []
+
+    for pred_surge, actual_surge, cancellation_rate in zip(
+        predictions, y_test, actual_cancellations
+    ):
+        # Higher surge → expect higher cancellation
+        # Measure: did predicted surge align with observed cancellation?
+
+        predicted_cancellation_rate = estimate_cancellation_rate(pred_surge)
+        actual_cancel = cancellation_rate
+
+        predicted_vs_actual_cancellation.append({
+            'predicted_surge': pred_surge,
+            'actual_surge': actual_surge,
+            'predicted_cancel_rate': predicted_cancellation_rate,
+            'actual_cancel_rate': actual_cancel,
+            'error': abs(predicted_cancel_rate - actual_cancel)
+        })
+
+    # Metrics
+    cancellation_prediction_mae = mean(
+        abs(df['error'] for df in predicted_vs_actual_cancellation)
+    )
+
+    return {
+        'surge_mape': mape,
+        'surge_accuracy': accuracy_of_surge_predictions,
+        'cancellation_prediction_error': cancellation_prediction_mae,
+        'cancellation_correlation': correlation(predictions, actual_cancellations)
+    }
+```
+
+#### Key Insights
+
+```
+1. DO include cancelled rides in training data
+   ✓ Use all requests (accepted + cancelled)
+   ✓ Label them with the surge that caused the cancellation
+   ✓ Model learns full picture of demand-surge-outcome
+
+2. DO use cancellation_rate as a feature
+   ✓ High cancellation_rate → feedback that surge was too high
+   ✓ Model learns to reduce surge if seeing high cancellations
+   ✓ Creates negative feedback loop for stability
+
+3. DON'T filter to only accepted rides
+   ✗ Creates selection bias
+   ✗ Model misses signal that surge caused cancellations
+   ✗ Overpredicts surge in high-demand scenarios
+
+4. Monitor cancellation correlation
+   ✓ Measure: does higher predicted surge correlate with higher cancellations?
+   ✓ Should see moderate positive correlation
+   ✓ If correlation too high: surge too aggressive
+   ✓ If correlation too low: surge too conservative
+
+5. Use cancellation data for post-processing
+   ✓ If recent cancellation rate > threshold
+   ✓ Reduce predicted surge by 10-20%
+   ✓ Trade off: small revenue loss for better user experience
+```
+
 ### Train-Test Split Strategy
 
 **Critical**: Don't use random split! Surge has strong temporal patterns.
