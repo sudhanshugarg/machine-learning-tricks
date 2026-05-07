@@ -448,6 +448,197 @@ study.optimize(objective, n_trials=50)
 best_params = study.best_params
 ```
 
+### Subsampling in XGBoost
+
+**What is Subsampling?**
+
+Subsampling (via `subsample` parameter) controls what fraction of training samples are randomly selected to build each tree. Instead of using all 5M rides to train each tree, you use a random subset.
+
+```
+subsample = 0.8 means:
+  - Randomly select 80% of training data
+  - Build tree on this 80% sample
+  - Remaining 20% is left out (OOB)
+  - Repeat for next tree with different random 80%
+```
+
+**Why Use Subsampling for Pricing Models?**
+
+1. **Prevents Overfitting**: Each tree sees different data subset → reduces memorization of specific rides
+
+2. **Improves Generalization**: Model learns general pricing patterns, not quirks of particular rides
+   - Example: If model sees only one $200 airport ride, subsampling prevents it from learning "all airport rides are $200"
+
+3. **Reduces Training Time**: Using 80% data is faster than 100%
+   - 5M rides: ~30% faster training
+   - Minimal accuracy loss
+
+4. **Robustness to Data Distribution Shifts**: Training on different subsets makes model more robust
+   - If pricing changes, model already learned from varied data
+   - More resilient to seasonal/weather changes
+
+**Trade-offs:**
+
+```
+Higher Subsample (0.9-1.0):
+  ✓ Better accuracy on training set
+  ✓ Faster convergence
+  ✗ Higher overfitting risk
+  ✗ Less robust to distribution shift
+  ✗ May memorize noise in data
+
+Lower Subsample (0.6-0.7):
+  ✓ Better generalization
+  ✓ More robust to data changes
+  ✓ Less prone to overfitting
+  ✗ Needs more trees for same accuracy
+  ✗ Slower convergence
+  ✗ Noisier training (less stable)
+
+Recommended for Base Price: 0.75-0.85
+  - Sweet spot for pricing accuracy vs generalization
+  - 0.8 is industry standard
+```
+
+**How Subsampling Affects Price Predictions:**
+
+```
+Scenario: Training with 5M rides, 100 trees
+
+Without Subsampling (subsample=1.0):
+  ├── Tree 1: Trained on all 5M rides
+  ├── Tree 2: Trained on all 5M rides
+  ├── Tree 3: Trained on all 5M rides
+  └── ...
+  Risk: Model overfits to specific ride patterns
+
+With Subsampling (subsample=0.8):
+  ├── Tree 1: Trained on random 4M rides
+  │   └── Example: misses all JFK airport rides
+  ├── Tree 2: Trained on different random 4M rides
+  │   └── Includes JFK rides, but misses some rush hour
+  ├── Tree 3: Trained on different random 4M rides
+  │   └── Has rush hour, but misses some bad weather
+  └── ...
+  Benefit: Ensemble learns general patterns
+         Each tree's blindspots covered by others
+```
+
+**Implementation:**
+
+```python
+import xgboost as xgb
+
+# During hyperparameter tuning
+params = {
+    'max_depth': 6,
+    'learning_rate': 0.08,
+    'subsample': 0.8,           # ← Subsample parameter
+    'colsample_bytree': 0.8,    # Feature subsampling (separate)
+    'n_estimators': 150,
+}
+
+model = xgb.XGBRegressor(**params)
+model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
+
+# Inference: All training data is used implicitly
+# Each tree makes prediction independently
+predictions = model.predict(X_test)  # Average of all 150 trees
+```
+
+**Other Subsampling Parameters:**
+
+```
+subsample (row sampling):
+  - Fraction of rows to sample for each tree
+  - Range: 0.0 to 1.0
+  - Default: 1.0 (no subsampling)
+  - Recommended: 0.75-0.85
+
+colsample_bytree (feature subsampling):
+  - Fraction of features to sample for each tree
+  - Range: 0.0 to 1.0
+  - Default: 1.0 (no subsampling)
+  - Recommended: 0.8-0.9
+  - Similar effect: prevents overfitting to specific features
+
+colsample_bylevel (feature subsampling per split):
+  - Fraction of features per tree level
+  - More fine-grained than colsample_bytree
+  - Recommended: 0.8-0.9
+
+subsample_freq (subsampling frequency):
+  - How often to do subsampling
+  - subsample_freq=1: subsample every tree
+  - subsample_freq=5: subsample every 5th tree
+  - Recommended for large datasets: 5-10
+```
+
+**Tuning Subsampling for Base Price Model:**
+
+```python
+# Grid search for optimal subsample value
+subsample_values = [0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0]
+results = []
+
+for subsample in subsample_values:
+    model = xgb.XGBRegressor(
+        max_depth=6,
+        learning_rate=0.08,
+        subsample=subsample,
+        colsample_bytree=0.8,
+        n_estimators=150
+    )
+
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
+    pred = model.predict(X_val)
+    mape = mean_absolute_percentage_error(y_val, pred)
+
+    results.append({'subsample': subsample, 'MAPE': mape})
+    print(f"subsample={subsample}: MAPE={mape:.4f}")
+
+# Example output:
+# subsample=0.60: MAPE=0.0628 (high generalization, lower accuracy)
+# subsample=0.70: MAPE=0.0542
+# subsample=0.75: MAPE=0.0501
+# subsample=0.80: MAPE=0.0489 ← Sweet spot
+# subsample=0.85: MAPE=0.0485
+# subsample=0.90: MAPE=0.0483
+# subsample=0.95: MAPE=0.0481
+# subsample=1.00: MAPE=0.0479 (best on validation, likely overfitting)
+
+# Choose subsample=0.8 (good balance)
+```
+
+**Subsampling vs. Dropout:**
+
+XGBoost subsampling is conceptually similar to dropout in neural networks:
+
+```
+Dropout (Neural Networks):
+  - Randomly disable neurons during training
+  - Prevents co-adaptation
+  - More robust features learned
+
+Subsampling (XGBoost):
+  - Randomly exclude training samples
+  - Forces trees to generalize
+  - Doesn't overfit to specific rides
+```
+
+**Key Takeaway for Base Price Model:**
+
+```
+✓ Use subsample=0.8 (drop 20% of data per tree)
+✓ Use colsample_bytree=0.8 (use 80% of features per tree)
+✓ This prevents overfitting on 5M rides
+✓ Model learns general pricing patterns
+✓ More robust when pricing changes
+✓ Better generalization to new routes/times
+```
+
+---
+
 ### Training Frequency & Schedule
 
 **Base Price Model Retraining:**
