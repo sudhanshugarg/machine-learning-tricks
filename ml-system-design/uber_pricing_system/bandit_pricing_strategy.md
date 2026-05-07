@@ -178,32 +178,139 @@ class UCBBandit:
 
 ### 3. Thompson Sampling
 
+#### Understanding the Beta Distribution
+
+The Beta distribution is the core of Thompson sampling. Here's the intuition:
+
+**What is Beta(α, β)?**
+
 ```
+β-distribution is a probability distribution parameterized by two numbers:
+  α (alpha) = number of successes (e.g., rides accepted at this price)
+  β (beta) = number of failures (e.g., rides rejected at this price)
+
+Mean of distribution = α / (α + β)
+  Example: Beta(80, 20) has mean = 80/100 = 0.80 (80% acceptance rate)
+```
+
+**Visual Intuition - How Beta Shapes Change:**
+
+```
+Low Data (high uncertainty):
+  Beta(1, 1) → completely flat, uniform [uniform trust in all values]
+  Beta(2, 1) → skewed right, "maybe this price is amazing" [1 success, 1 failure]
+  Beta(1, 2) → skewed left, "maybe this price is terrible" [1 success, 1 failure]
+
+      Beta(1,1)              Beta(2,1)              Beta(1,2)
+    Wide & flat      →      Skewed right    →      Skewed left
+    [Lots of uncertainty]    [Uncertain but optimistic]  [Uncertain but pessimistic]
+
+Medium Data (moderate uncertainty):
+  Beta(10, 10) → peaked at 0.5, moderate width
+  Beta(15, 5) → peaked at 0.75, moderate width
+
+        Beta(10,10)          Beta(15,5)
+       ╱╲   peak at 0.5    peak at 0.75
+      ╱  ╲  moderate width
+
+High Data (low uncertainty):
+  Beta(100, 20) → narrow peak at 0.83, very concentrated
+  Beta(80, 80) → narrow peak at 0.50, very concentrated
+  Beta(10, 100) → narrow peak at 0.09, very concentrated
+
+      Beta(100,20)      Beta(80,80)       Beta(10,100)
+      sharp peak    →   sharp peak   →    sharp peak
+      near 0.83         near 0.50         near 0.09
+    [High confidence]  [High confidence]  [High confidence]
+```
+
+**Why Beta Works for Pricing:**
+
+1. **Untested prices have wide distributions**
+   - Beta(1, 1) for new price: high variance
+   - When you sample, you might get 0.2, or 0.8, or 0.5
+   - This creates natural exploration!
+
+2. **Well-tested prices have narrow distributions**
+   - Beta(100, 20): tight peak at 0.83
+   - Samples cluster around 0.83
+   - Less exploration, more exploitation
+
+3. **Automatic uncertainty quantification**
+   - No need to manually set exploration rates
+   - Shape automatically adapts as data grows
+
+**Concrete Example: 3 Prices**
+
+```
+Price $10: 80 accepts, 20 rejects → Beta(81, 21)
+  Mean: 81/102 = 0.794 (79.4% acceptance rate)
+  Shape: narrow, concentrated
+  Sample 1000 times: mostly 0.75-0.85 range
+
+Price $12: 15 accepts, 5 rejects → Beta(16, 6)
+  Mean: 16/22 = 0.727 (72.7% acceptance rate)
+  Shape: wider than $10 (less data)
+  Sample 1000 times: spread from 0.4 to 0.95 (high variance)
+
+Price $14: 2 accepts, 2 rejects → Beta(3, 3)
+  Mean: 3/6 = 0.5 (50% acceptance rate)
+  Shape: very wide (almost no data)
+  Sample 1000 times: completely scattered 0.0 to 1.0
+
+Thompson Sampling in action:
+
+  Iteration 1:
+    Sample $10: θ₁₀ ~ Beta(81, 21) → 0.81
+    Sample $12: θ₁₂ ~ Beta(16, 6) → 0.68  (happened to be lower due to variance)
+    Sample $14: θ₁₄ ~ Beta(3, 3) → 0.92   (happened to be high due to high variance!)
+
+    Choose: $14 (even though has least data, uncertainty was lucky)
+
+  Iteration 2:
+    User rejects at $14
+    Update: Beta(3, 4) for $14
+
+    Sample $10: θ₁₀ ~ Beta(81, 21) → 0.79
+    Sample $12: θ₁₂ ~ Beta(16, 6) → 0.71
+    Sample $14: θ₁₄ ~ Beta(3, 4) → 0.31  (now lower due to rejection)
+
+    Choose: $10
+
+  Iteration 3:
+    After many samples, Beta(81, 21) stays as the winner
+    $14 Beta(3, 4) gets more data → distribution narrows
+    Eventually $14 settles to true value, stops exploring as much
+```
+
+**Key Insight: The Magic**
+
+The Beta distribution naturally implements exploration-exploitation:
+- High variance (untested) → sometimes sampled high → explore
+- Low variance (well-tested) → consistently sampled at true value → exploit
+- No hard-coded exploration rate needed!
+
 Bayesian approach: maintain belief about price quality, sample from posterior
 
 Algorithm:
   For each price i:
-    Maintain Beta distribution: Beta(successes_i, failures_i)
-    Sample from posterior: θ_i ~ Beta(successes_i, failures_i)
+    Maintain Beta distribution: Beta(α, β) where:
+      α = successes (rides accepted)
+      β = failures (rides rejected)
+
+    Sample from posterior: θ_i ~ Beta(α, β)
     Select price with highest sampled θ
 
 Intuition:
-  - As you test a price more, distribution becomes narrower (higher confidence)
-  - Prices with high average reward + high uncertainty still get sampled
-  - Uncertainty automatically decreases → less exploration over time
+  - Untested prices: wide Beta distribution → high variance → sometimes sampled high → explores
+  - Tested prices: narrow Beta distribution → low variance → concentrates → exploits
+  - Uncertainty automatically decreases as you gather data
 
-Example with binary outcomes (accept/reject):
-  Price $10: 80 accepts, 20 rejects → Beta(80, 20)
-  Price $12: 15 accepts, 5 rejects → Beta(15, 5)
+```
 
-  Sample from each:
-    θ_10 ~ Beta(80, 20) → samples around 0.80
-    θ_12 ~ Beta(15, 5) → samples around 0.75 but higher variance
+**Python Implementation:**
 
-  Sometimes $12 sampled higher due to uncertainty → explore it more
-
-Python:
-
+```python
 class ThompsonSamplingBandit:
     def __init__(self, price_candidates):
         self.prices = price_candidates
@@ -231,6 +338,60 @@ class ThompsonSamplingBandit:
             self.successes[idx] += 1
         else:
             self.failures[idx] += 1
+```
+
+#### Real-World Example: 3 Prices Over Time
+
+```
+Initial state (no data):
+  Price $10: Beta(1, 1)  → flat, completely uncertain
+  Price $12: Beta(1, 1)  → flat, completely uncertain
+  Price $14: Beta(1, 1)  → flat, completely uncertain
+
+After 100 rides:
+  Price $10: 80 accepts, 20 rejects → Beta(81, 21)
+    Mean: 79% acceptance
+    Shape: NARROW peak ← High confidence
+    Samples 1000x: mostly 73-85%
+
+  Price $12: 60 accepts, 40 rejects → Beta(61, 41)
+    Mean: 60% acceptance
+    Shape: MEDIUM peak ← Medium confidence
+    Samples 1000x: spread 50-70%
+
+  Price $14: 10 accepts, 90 rejects → Beta(11, 91)
+    Mean: 11% acceptance
+    Shape: NARROW, LEFT-SKEWED ← High confidence it's bad
+    Samples 1000x: mostly 3-18%
+
+Thompson sampling decision (pick best sampled θ):
+  Sample iteration 1:
+    $10: sample = 0.78  (narrow range)
+    $12: sample = 0.55  (wider range)
+    $14: sample = 0.08  (narrow, near true value)
+    → Choose $10 ✓
+
+  Sample iteration 2:
+    $10: sample = 0.81  (narrow)
+    $12: sample = 0.68  (wider - chance to explore!)
+    $14: sample = 0.05  (narrow, knows it's bad)
+    → Choose $10 ✓
+
+  Sample iteration 3:
+    $10: sample = 0.76  (narrow)
+    $12: sample = 0.45  (wide variance - low sample this time)
+    $14: sample = 0.12  (narrow)
+    → Choose $10 ✓
+
+Key observation:
+  - $10 almost always wins because of narrow, high peak
+  - $12 occasionally wins when high variance produces lucky sample
+  - $14 almost never wins because known to be bad
+  - But all prices still get tested, proportional to uncertainty
+
+Result: Optimal prices explored more, bad prices explored less
+        Exploration happens naturally through variance
+        No hand-tuned exploration rate needed!
 ```
 
 **Pros:**
