@@ -1,0 +1,3 @@
+This round is a fundamentals-heavy Machine Learning Engineer discussion. The interviewer typically starts with a simple supervised learning setup, then uses a plot of two overlapping class distributions to probe how well you understand modeling assumptions, decision boundaries, feature choice, and error trade-offs.
+
+The question often feels conversational rather than rigidly scripted. Expect the interviewer to give hints or feedback and use your answer to branch into deeper follow-ups.

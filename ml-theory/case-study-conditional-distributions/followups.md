@@ -38,6 +38,33 @@ The interviewer may repeatedly ask how you would choose or create better feature
 
 ---
 
+## Confounding Variables
+
+You may be asked about confounding and its impact on causal inference:
+
+- **What are confounding variables?**
+  - What is a confounder and how does it differ from a regular predictor?
+  - Why do confounders bias your estimates of feature importance?
+
+- **How do you detect confounders?**
+  - What patterns in the data suggest a variable is confounding?
+  - How do you use correlation, stratification, and domain knowledge to identify them?
+
+- **How do you handle confounders in your model?**
+  - When should you include a confounder as a feature vs. exclude it?
+  - How do you interpret coefficients when confounders are present?
+  - What's the difference between controlling and conditioning on a confounder?
+
+- **Confounders vs. mediators: How do you tell them apart?**
+  - What's the difference between a confounder and a mediator in a causal DAG?
+  - Why do you handle them differently?
+
+- **How confounders affect your prediction vs. inference goals?**
+  - Do confounders hurt prediction accuracy? Do they hurt causal inference?
+  - When do you care about each?
+
+---
+
 ## Model Choice
 
 You may be asked:
