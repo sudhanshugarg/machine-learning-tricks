@@ -44,8 +44,12 @@ This distinction matters because it clarifies that we're modeling uncertainty in
 
 ### 1. Likelihood Function
 
-For a single observation, assuming $y_i \sim N(\mu_i, \sigma^2)$ where $\mu_i = \mathbf{x}_i^T \boldsymbol{\beta}$:
+For a single observation, the **conditional distribution** of y given x is:
+$$y_i | \mathbf{x}_i \sim N(\mu_i, \sigma^2) \quad \text{where} \quad \mu_i = \mathbf{x}_i^T \boldsymbol{\beta}$$
 
+This comes from the model: $y_i = \mathbf{x}_i^T \boldsymbol{\beta} + \epsilon_i$ with $\epsilon_i \sim N(0, \sigma^2)$.
+
+The conditional probability density is:
 $$P(y_i | \mathbf{x}_i, \boldsymbol{\beta}, \sigma^2) = \frac{1}{\sigma\sqrt{2\pi}} \exp\left(-\frac{(y_i - \mathbf{x}_i^T \boldsymbol{\beta})^2}{2\sigma^2}\right)$$
 
 For all $n$ observations (assuming independence):
@@ -53,11 +57,15 @@ $$L(\boldsymbol{\beta}, \sigma^2 | X, y) = \prod_{i=1}^{n} \frac{1}{\sigma\sqrt{
 
 ### 2. Log-Likelihood
 
-$$\ell(\boldsymbol{\beta}, \sigma^2) = -\frac{n}{2}\log(2\pi) - n\log(\sigma) - \frac{1}{2\sigma^2}\sum_{i=1}^{n}(y_i - \mathbf{x}_i^T \boldsymbol{\beta})^2$$
+Taking the log of the joint likelihood:
 
-$$\ell(\boldsymbol{\beta}, \sigma^2) = -\frac{n}{2}\log(2\pi) - n\log(\sigma) - \frac{1}{2\sigma^2}\text{RSS}(\boldsymbol{\beta})$$
+$$\ell(\boldsymbol{\beta}, \sigma^2) = \sum_{i=1}^{n} \log P(y_i | \mathbf{x}_i, \boldsymbol{\beta}, \sigma^2)$$
 
-where RSS is the Residual Sum of Squares.
+$$= -\frac{n}{2}\log(2\pi) - n\log(\sigma) - \frac{1}{2\sigma^2}\sum_{i=1}^{n}(y_i - \mathbf{x}_i^T \boldsymbol{\beta})^2$$
+
+$$= -\frac{n}{2}\log(2\pi) - n\log(\sigma) - \frac{1}{2\sigma^2}\text{RSS}(\boldsymbol{\beta})$$
+
+where RSS is the Residual Sum of Squares (sum of squared errors).
 
 ### 3. Finding MLE for $\boldsymbol{\beta}$
 
