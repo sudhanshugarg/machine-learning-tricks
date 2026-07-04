@@ -14,8 +14,11 @@ class LinearRegressionMLE:
     """
     Linear Regression using Maximum Likelihood Estimation.
 
-    Assumes: y_i = β₀ + β₁x_{i1} + ... + β_p x_{ip} + ε_i
-    where ε_i ~ N(0, σ²)
+    Model: y_i = β₀ + β₁x_{i1} + ... + β_p x_{ip} + ε_i
+    where ε_i ~ N(0, σ²) - errors are Gaussian
+
+    Key assumption: Errors (not raw y) are normally distributed.
+    This means y_i | x_i ~ N(μ_i, σ²) - y is CONDITIONALLY Gaussian given x.
 
     This demonstrates that OLS is equivalent to MLE under Gaussian error assumption.
     """

@@ -4,16 +4,39 @@
 
 Given a dataset of features $X = \{x_1, x_2, ..., x_n\}$ and corresponding targets $y = \{y_1, y_2, ..., y_n\}$, estimate the regression coefficients $\beta = [\beta_0, \beta_1, ..., \beta_p]$ using Maximum Likelihood Estimation.
 
-**Assumption:** The target values follow a normal distribution:
+**Key Assumption:** The errors are normally distributed:
 $$y_i = \beta_0 + \beta_1 x_{i1} + ... + \beta_p x_{ip} + \epsilon_i$$
 
-where $\epsilon_i \sim N(0, \sigma^2)$ (errors are normally distributed with constant variance).
+where $\epsilon_i \sim N(0, \sigma^2)$ (errors are independent, normally distributed with constant variance).
+
+**What this implies:** Given x_i, the target y_i follows a conditional normal distribution:
+$$y_i | x_i \sim N(\mu_i, \sigma^2) \quad \text{where} \quad \mu_i = \beta_0 + \beta_1 x_{i1} + ... + \beta_p x_{ip}$$
+
+**Important:** We assume y is **conditionally Gaussian** given x, NOT that y is marginally Gaussian. The relationship between x and y is deterministic; only the deviations from this relationship (the errors) are random.
 
 ---
 
 ## Key Insight
 
 This problem demonstrates a fundamental connection: **Ordinary Least Squares (OLS) regression is equivalent to Maximum Likelihood Estimation under the assumption of Gaussian errors**.
+
+---
+
+## Clarification: Conditional vs. Marginal Gaussianity
+
+**Important distinction for interviews:**
+
+- **What we assume:** Errors are Gaussian: $\epsilon_i \sim N(0, \sigma^2)$
+- **What this means:** y is **conditionally** Gaussian given x: $y_i | x_i \sim N(f(x_i), \sigma^2)$
+- **What we DON'T assume:** y is marginally Gaussian or that (x, y) are jointly Gaussian
+
+**Example:** If x ranges from 0 to 10 and y = 2x + ε where ε ~ N(0, 1):
+- y values near x=0 cluster around 0 (approximately)
+- y values near x=10 cluster around 20 (approximately)
+- The marginal distribution of y is NOT Gaussian - it has multiple modes!
+- But given any specific x, the conditional distribution of y is Gaussian
+
+This distinction matters because it clarifies that we're modeling uncertainty in predictions (the error term), not claiming the raw data is Gaussian.
 
 ---
 
