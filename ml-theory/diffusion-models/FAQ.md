@@ -36,6 +36,118 @@ It's like learning to undo corruptions of increasing severity, then chaining tho
 
 ---
 
+### Q: What role does the training dataset have? The network is learning to remove noise (which is generic Gaussian noise). Isn't it just learning generic noise removal, independent of what images it sees?
+
+**A:** This is a crucial misconception. The network is **NOT** learning generic Gaussian noise removal. It's learning **domain-specific denoising based on the training distribution**.
+
+**The key insight:**
+The network learns to predict noise, but this prediction is deeply conditioned on what images look like in the training set. Different training datasets → completely different learned behavior.
+
+**Mathematical perspective:**
+
+The forward process is generic:
+$$x_t = \sqrt{\bar{\alpha}_t} x_0 + \sqrt{1 - \bar{\alpha}_t} \epsilon$$
+
+The noise $\epsilon$ is always standard Gaussian (generic). But the network learns:
+$$\epsilon_\theta(x_t, t) = \text{predicted noise}$$
+
+Here's the subtlety: **The network must predict what noise was added, given what it knows about valid images in the training distribution.**
+
+```
+If you show the network a very noisy image:
+  - If trained on MNIST: "This noisy pattern looks like it could be a digit,
+                          so the 'signal' is probably in these pixel clusters"
+  - If trained on faces: "This noisy pattern looks like it could be a face,
+                          so the 'signal' is probably in the eye/nose region"
+  
+Same noisy image, different predictions! Because different training distributions
+have different notions of "what is likely signal vs noise"
+```
+
+**Concrete example:**
+
+Imagine training two networks on 28×28 grayscale images, but:
+- Network A: trained on MNIST digits (0-9)
+- Network B: trained on random noise (pixels completely random)
+
+At t=500 (halfway corruption), both see similar noisy images. But:
+
+```
+MNIST Network (A):
+  "I know MNIST has connected strokes. This noisy blob looks like it could be
+   a '3' or '5'. The noise is probably the random speckling. Let me predict
+   the noise pattern that would most likely corrupt a digit."
+   → Denoised output: looks like a digit
+
+Random Noise Network (B):
+  "In my training data, all pixels are independent random. Every pattern is
+   equally likely. I have no notion of 'connected strokes' or 'digit shapes'."
+   → Denoised output: random-looking pixels
+```
+
+**Why the training distribution matters:**
+
+The network learns an implicit model of "what images in this distribution look like."
+
+1. **Signal vs Noise**: Learned in context of training data
+   - MNIST: "curved strokes + connected regions" = signal
+   - Faces: "eyes, noses, symmetry" = signal  
+   - Random noise: "any pattern" = signal
+
+2. **Structural priors**: Absorbed from training examples
+   - MNIST network learns digits are centered, bounded, have certain stroke widths
+   - Face network learns faces have symmetry, proportions, etc.
+
+3. **Feature restoration**: Only restores features seen in training
+   - Train on smooth images → denoised output is smooth
+   - Train on textured images → denoised output has texture
+   - Train on random noise → denoised output is random noise
+
+**This is why generation works:**
+
+When you generate by iterative denoising from pure noise, the network gradually shapes the noise into valid samples from the **training distribution**:
+
+```
+Random Noise → [Network trained on MNIST] → MNIST-like digit
+Random Noise → [Network trained on faces] → face-like image
+Random Noise → [Network trained on random pixels] → random pixels
+```
+
+**The mathematics underneath:**
+
+The loss is:
+$$\mathcal{L} = \mathbb{E}_{x_0 \sim p_{\text{data}}, t, \epsilon} \left[ \| \epsilon - \epsilon_\theta(x_t, t) \|^2 \right]$$
+
+The key: **$p_{\text{data}}$ is your training distribution**. The network learns:
+- "Given this corrupted image at timestep t, and knowing that $x_0$ comes from my training distribution, predict the noise"
+
+This is distribution-specific. If you change $p_{\text{data}}$ (different dataset), you change what the network learns.
+
+**Out-of-distribution behavior:**
+
+If you generate from a network trained on MNIST but accidentally feed it a corrupted **face** image at test time:
+```
+Network was trained to denoise things that look like digits.
+Face image doesn't match that distribution.
+→ Network produces garbage or tries to "correct" it toward a digit shape
+```
+
+**Summary table:**
+
+| Aspect | Truth | Misconception |
+|--------|-------|----------------|
+| **What's being learned?** | Domain-specific denoising | Generic Gaussian noise removal |
+| **Does training data matter?** | Absolutely! Entirely determines learned behavior | No, only the noise schedule matters |
+| **Can same network work on different datasets?** | No (unless trained jointly) | Yes (if just learning noise) |
+| **Why does generation produce images "like training data"?** | Network learned to restore training distribution | Network has no preference |
+| **Could you train on faces and generate digits?** | No (or very poorly) | Yes (noise removal is generic) |
+
+**Practical implication:**
+
+You can't just train a diffusion model on MNIST and then use it to generate faces. The network has learned "how to denoise things that look like handwritten digits," not "how to remove Gaussian noise in general."
+
+---
+
 ### Q: What exactly is epsilon (ε)? If I sample the same x_0 at timestep 5 twice, will the noisy image x_5 be different both times?
 
 **A:** Excellent question! This is crucial to understanding the forward process.

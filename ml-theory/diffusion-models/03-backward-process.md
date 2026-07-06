@@ -108,14 +108,53 @@ Conv2d(64, 1, kernel=3)
 
 We want the network to predict the added noise accurately:
 
-$$\mathcal{L} = \mathbb{E}_{x_0, t, \epsilon} \left[ \| \epsilon - \epsilon_\theta(x_t, t) \| ^2 \right]$$
+$$\mathcal{L} = \mathbb{E}_{x_0 \sim p_{\text{data}}, t, \epsilon} \left[ \| \epsilon - \epsilon_\theta(x_t, t) \| ^2 \right]$$
 
 Where:
-- $x_0$ = real MNIST image (from training set)
+- $x_0$ = real MNIST image (sampled from **training distribution** $p_{\text{data}}$)
 - $t$ = random timestep (sample uniformly from 1 to T)
 - $\epsilon$ = random Gaussian noise
 - $x_t = \sqrt{\bar{\alpha}_t} x_0 + \sqrt{1 - \bar{\alpha}_t} \epsilon$ = noisy image
 - Network must predict $\epsilon$ given $x_t$ and $t$
+
+### Critical: Training Data Shapes What the Network Learns
+
+**The training data is NOT irrelevant!** The network learns **distribution-specific denoising**, not generic noise removal.
+
+Here's why:
+
+Given a noisy image $x_t$, there are infinite valid decompositions:
+$$x_t = \sqrt{\bar{\alpha}_t} \, x_0 + \sqrt{1 - \bar{\alpha}_t} \, \epsilon$$
+
+The network must predict which noise $\epsilon$ was added. But this depends on knowing what images in the training distribution look like.
+
+**Example:**
+```
+Same noisy image, different networks:
+
+[Network trained on MNIST]:
+  "I know MNIST has centered strokes and connected regions.
+   The 'signal' is probably in these pixel clusters.
+   The noise is the random speckling around them."
+  → Predicts noise that would corrupt a digit
+
+[Network trained on random pixels]:
+  "In my training data, all pixels are independent.
+   There is no concept of 'structure' or 'connected regions'.
+   I can't distinguish signal from noise meaningfully."
+  → Random prediction, or very poor denoising
+```
+
+**Consequence: Generation bias**
+
+When you generate by denoising from scratch, the network progressively restores the **training distribution**:
+
+```
+MNIST network: Random noise → MNIST digits
+Face network: Random noise → Human faces
+```
+
+Same architecture, different training data → completely different outputs.
 
 ### Training Algorithm
 
