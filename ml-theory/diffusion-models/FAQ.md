@@ -36,6 +36,77 @@ It's like learning to undo corruptions of increasing severity, then chaining tho
 
 ---
 
+### Q: The label is epsilon (noise per pixel). Is this the cumulative noise added over ALL T steps, or just the noise in a single step?
+
+**A:** Great distinction! It's neither—it's the **equivalent noise in the jump formula**, not cumulative.
+
+**The confusion:**
+
+There are two ways to think about noise:
+
+**Option 1: Step-by-step (iterative)**
+$$x_1 = \sqrt{\alpha_1} x_0 + \sqrt{1-\alpha_1} \epsilon_1$$
+$$x_2 = \sqrt{\alpha_2} x_1 + \sqrt{1-\alpha_2} \epsilon_2$$
+$$\vdots$$
+$$x_t = \sqrt{\alpha_t} x_{t-1} + \sqrt{1-\alpha_t} \epsilon_t$$
+
+Each step has its own $\epsilon_i$. But this is NOT what we use for training.
+
+**Option 2: Direct jump (what we actually use)**
+$$x_t = \sqrt{\bar{\alpha}_t} x_0 + \sqrt{1 - \bar{\alpha}_t} \epsilon$$
+
+There's ONE epsilon, sampled once. This $\epsilon$ is the "equivalent noise" that transforms $x_0$ directly to $x_t$ in one shot.
+
+**What's the label in training?**
+
+The label is **the single $\epsilon$ from the jump formula**, not cumulative:
+
+```python
+# Forward process (training):
+x_0 = load_image()           # MNIST digit
+epsilon = torch.randn_like(x_0)  # Sample ONE noise vector
+t = random.randint(0, T)     # Sample ONE timestep
+
+# Jump directly from x_0 to x_t
+alpha_bar = get_alpha_bar(t)
+x_t = torch.sqrt(alpha_bar) * x_0 + torch.sqrt(1 - alpha_bar) * epsilon
+
+# Train network to predict this SINGLE epsilon
+epsilon_pred = network(x_t, t)
+loss = mse(epsilon, epsilon_pred)  # Label is this ONE epsilon
+```
+
+**Why the jump formula instead of iterative?**
+
+The jump formula is mathematically equivalent to the iterative process, but:
+1. **Faster**: Compute $x_t$ in O(1) time, not O(t)
+2. **Simpler**: One epsilon, not t different epsilons
+3. **Better training**: Uniform sampling of timesteps
+
+**Key insight: The relationship**
+
+The jump formula with one $\epsilon$ is equivalent to iterating $x_0 → x_1 → ... → x_t$ with step-wise epsilons because of how the noise schedules multiply:
+
+$$\bar{\alpha}_t = \prod_{i=1}^{t} \alpha_i$$
+
+The cumulative product combines all the individual steps into one "jump noise."
+
+**Practical implication:**
+
+During generation, you don't need to know the step-wise epsilons. You only need the network's prediction of the single equivalent noise at each timestep:
+
+```python
+x_t = pure_noise  # Start here
+
+for t in range(T, 0, -1):
+    epsilon_pred = network(x_t, t)  # Predict the equiv. noise
+    x_t = denoise_formula(x_t, epsilon_pred, t)  # Remove it
+    
+# Result: x_0
+```
+
+---
+
 ### Q: During training, does the U-Net train on all T timesteps sequentially? And do I need to feed it the original image x_0?
 
 **A:** No to both! This is a key efficiency insight.
