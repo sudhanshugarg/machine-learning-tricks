@@ -15,15 +15,20 @@ $$q(x_t | x_0) = \sqrt{\bar{\alpha}_t} \, x_0 + \sqrt{1 - \bar{\alpha}_t} \, \ep
 Where:
 - $x_t$ = noisy image at timestep $t$
 - $x_0$ = original clean image
-- $\epsilon \sim \mathcal{N}(0, \mathbf{I})$ = Gaussian noise (sampled once)
+- $\epsilon \sim \mathcal{N}(0, \mathbf{I})$ = **Gaussian noise, independently sampled each time** (mean 0, variance 1)
 - $\bar{\alpha}_t$ = cumulative product of noise schedule coefficients
 - $1 - \bar{\alpha}_t$ = variance of noise at timestep $t$
 
 **Intuition**: 
 - As $t$ increases, $\bar{\alpha}_t$ decreases
 - This means: less signal ($x_0$), more noise ($\epsilon$)
-- At $t=0$: image is mostly original
-- At $t=T$: image is nearly pure noise
+- At $t=0$: image is mostly original (very little random noise added)
+- At $t=T$: image is nearly pure noise (signal almost completely drowned out)
+
+**Critical: Epsilon is sampled fresh each time**
+- Every call to the forward process samples a new $\epsilon$
+- Same $x_0$ at same $t$ will produce **different** $x_t$ if epsilon differs
+- This is intentional! It provides data augmentation and prevents overfitting
 
 ---
 
@@ -41,6 +46,33 @@ Where $s$ is a small offset (e.g., 0.008) to prevent $\bar{\alpha}_T$ from becom
 - $t=500$: $\bar{\alpha}_{500} \approx 0.5$ (equal signal and noise)
 - $t=750$: $\bar{\alpha}_{750} \approx 0.25$ (mostly noise)
 - $t=1000$: $\bar{\alpha}_{1000} \approx 0.0$ (nearly pure noise)
+
+---
+
+## Important: Epsilon is Randomly Sampled
+
+Before diving into examples, understand this crucial point:
+
+$$\epsilon \text{ is NOT a fixed constant—it's randomly sampled}$$
+
+Each call to `forward_process(x_0, t)` **samples a fresh epsilon**:
+
+```
+Call 1: forward_process(x_0, t=5)
+  ε_1 ~ N(0, I)  [independent sample]
+  x_5 = √(ᾱ_5) * x_0 + √(1-ᾱ_5) * ε_1
+
+Call 2: forward_process(x_0, t=5)  [same x_0, same t!]
+  ε_2 ~ N(0, I)  [DIFFERENT independent sample]
+  x_5' = √(ᾱ_5) * x_0 + √(1-ᾱ_5) * ε_2
+
+Result: x_5 ≠ x_5' (almost certainly)
+```
+
+**Why?** This creates **natural data augmentation**:
+- One real image → infinite corrupted versions
+- Network never sees the exact same noisy image twice
+- Prevents overfitting and memorization
 
 ---
 

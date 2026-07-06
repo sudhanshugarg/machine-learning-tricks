@@ -36,6 +36,64 @@ It's like learning to undo corruptions of increasing severity, then chaining tho
 
 ---
 
+### Q: What exactly is epsilon (ε)? If I sample the same x_0 at timestep 5 twice, will the noisy image x_5 be different both times?
+
+**A:** Excellent question! This is crucial to understanding the forward process.
+
+**What is ε?**
+- ε is a **random variable** sampled from a standard normal distribution
+- Mean: μ = 0
+- Variance: σ² = 1
+- Notation: $\epsilon \sim \mathcal{N}(0, \mathbf{I})$
+- Each time you sample, you get a different realization
+
+**Sampling x_0 twice at t=5:**
+
+Yes, you will get **different noisy images** both times. Here's why:
+
+```
+First training step:
+  x_0 = [some MNIST digit]
+  ε_1 ~ N(0, I)  [sample new random noise]
+  x_5^(1) = √(ᾱ_5) * x_0 + √(1-ᾱ_5) * ε_1
+
+Second training step (same x_0, same t):
+  x_0 = [same MNIST digit]
+  ε_2 ~ N(0, I)  [sample NEW random noise, different from ε_1]
+  x_5^(2) = √(ᾱ_5) * x_0 + √(1-ᾱ_5) * ε_2
+
+Result: x_5^(1) ≠ x_5^(2) because ε_1 ≠ ε_2
+```
+
+**Why this matters:**
+- Every epoch, every batch, you get *different* corrupted versions of the same image
+- This prevents the network from memorizing specific noisy patterns
+- It creates diverse training data from limited real images
+- The network learns to denoise **all possible noise realizations**, not just specific ones
+
+**Code illustration:**
+```python
+x_0 = torch.randn(1, 1, 28, 28)  # Same MNIST digit
+
+# First sample
+epsilon_1 = torch.randn_like(x_0)  # Independent sample
+x_5_v1 = torch.sqrt(alpha_bar_5) * x_0 + torch.sqrt(1 - alpha_bar_5) * epsilon_1
+
+# Second sample
+epsilon_2 = torch.randn_like(x_0)  # Independent sample
+x_5_v2 = torch.sqrt(alpha_bar_5) * x_0 + torch.sqrt(1 - alpha_bar_5) * epsilon_2
+
+# Check: are they different?
+print(torch.allclose(x_5_v1, x_5_v2))  # False (almost certainly)
+```
+
+**Practical implications:**
+- You can see the same image x_0 many times during training
+- Each time it gets corrupted differently (different ε)
+- Network learns robust denoising, not overfitting to specific noise patterns
+
+---
+
 ### Q: Why is the timestep embedding necessary? Can't the network just take t as a scalar input?
 
 **A:** Technically yes, but it would be very inefficient. Here's why:
