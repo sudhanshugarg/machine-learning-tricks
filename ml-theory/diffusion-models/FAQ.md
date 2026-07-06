@@ -36,6 +36,105 @@ It's like learning to undo corruptions of increasing severity, then chaining tho
 
 ---
 
+### Q: During training, does the U-Net train on all T timesteps sequentially? And do I need to feed it the original image x_0?
+
+**A:** No to both! This is a key efficiency insight.
+
+**Single-step training (not sequential):**
+
+You do NOT iterate through timesteps 1→2→...→T during training. Instead:
+
+```python
+# NAIVE (WRONG - don't do this):
+for t in range(1, T+1):
+  x_t = forward_process(x_0, t)
+  noise_pred = network(x_t, t)
+  loss += ||noise - noise_pred||²
+  # Very slow! T forward passes per image
+
+# EFFICIENT (CORRECT - what we actually do):
+t = random.randint(1, T)  # Sample ONE random timestep
+x_t = forward_process(x_0, t)  # One forward pass
+noise_pred = network(x_t, t)
+loss = ||noise - noise_pred||²
+# Single pass per image!
+```
+
+**Why this works:** By sampling random timesteps uniformly, you ensure the network learns denoising across all corruption levels. Over many training iterations, it sees enough variety of timesteps that it learns the full spectrum.
+
+**Do you need x_0?**
+
+YES, but NOT as an input to the network. Here's the distinction:
+
+```
+During training:
+
+Step 1: Sample x_0 from training dataset
+        (MNIST image)
+
+Step 2: Use x_0 to CREATE noisy image x_t
+        x_t = √(ᾱ_t) * x_0 + √(1-ᾱ_t) * ε
+        (You compute this, don't show to network)
+
+Step 3: Feed ONLY x_t and t to network
+        network(x_t, t) → predicts noise
+
+Step 4: Compare prediction to actual noise ε
+        loss = ||ε - ε_θ(x_t, t)||²
+
+Network NEVER sees x_0 directly!
+```
+
+**Training loop (pseudo-code):**
+
+```python
+for epoch in range(num_epochs):
+  for x_0 in training_dataset:  # x_0 is needed here
+    
+    # Sample random timestep
+    t = random.randint(0, T)
+    
+    # Sample random noise
+    epsilon = torch.randn_like(x_0)
+    
+    # Create noisy image (x_0 used here)
+    alpha_bar = get_alpha_bar(t)
+    x_t = torch.sqrt(alpha_bar) * x_0 + torch.sqrt(1 - alpha_bar) * epsilon
+    
+    # Network ONLY sees x_t and t, NOT x_0
+    epsilon_pred = network(x_t, t)
+    
+    # Loss: predict the noise
+    loss = mse_loss(epsilon, epsilon_pred)
+    
+    # Backprop
+    loss.backward()
+    optimizer.step()
+```
+
+**Per-pixel loss:**
+
+Yes, the loss is computed per-pixel:
+
+```
+x_t shape: (B, 1, 28, 28)
+epsilon shape: (B, 1, 28, 28)
+epsilon_pred shape: (B, 1, 28, 28)
+
+loss = mean((epsilon - epsilon_pred)²)  # MSE over all pixels
+```
+
+**Key efficiency insight:**
+
+This is why diffusion models are practical to train:
+- Each training step: one forward pass (not T passes)
+- One loss computation (not T loss computations)
+- Linear time in batch size, not exponential in T
+
+If you had to train on all T timesteps sequentially, training would be 1000× slower!
+
+---
+
 ### Q: What role does the training dataset have? The network is learning to remove noise (which is generic Gaussian noise). Isn't it just learning generic noise removal, independent of what images it sees?
 
 **A:** This is a crucial misconception. The network is **NOT** learning generic Gaussian noise removal. It's learning **domain-specific denoising based on the training distribution**.

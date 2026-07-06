@@ -158,18 +158,40 @@ Same architecture, different training data → completely different outputs.
 
 ### Training Algorithm
 
+**IMPORTANT: Single-step training, not sequential!**
+
 ```
 For each training iteration:
-  1. Sample real image x_0 from MNIST training set
-  2. Sample random timestep t ∈ [1, T]
+  1. Sample real image x_0 from training set
+     (x_0 is used to CREATE x_t, but NOT fed to network)
+  
+  2. Sample ONE random timestep t ∈ [1, T]
+     (Not all timesteps—just one!)
+  
   3. Sample random noise ε ~ N(0, I)
+  
   4. Compute noisy image: x_t = √(ᾱ_t) x_0 + √(1-ᾱ_t) ε
-  5. Forward pass: ε_pred = network(x_t, t)
+     (This is where x_0 is used)
+  
+  5. Forward pass through network:
+     ε_pred = network(x_t, t)
+     (Network ONLY sees x_t and t, NOT x_0)
+  
   6. Compute loss: L = ||ε - ε_pred||²
+     (MSE between actual noise and predicted noise, per pixel)
+  
   7. Backprop and update network
 ```
 
-Key insight: **The network sees noisy images at all timesteps equally**, so it learns to denoise at any corruption level.
+**Why sample random timesteps instead of all T?**
+
+You don't need to train on all T timesteps per image:
+- Training on one random t per image is sufficient
+- Over many training iterations, you see diverse timesteps
+- Each iteration is fast: only one forward pass
+- If you trained on all T sequentially, it would be ~1000× slower!
+
+**Key insight: The network sees noisy images at different corruption levels equally**, so it learns to denoise robustly at any timestep.
 
 ---
 
