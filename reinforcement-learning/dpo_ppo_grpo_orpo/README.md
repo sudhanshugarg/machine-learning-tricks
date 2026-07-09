@@ -16,13 +16,14 @@ If you only remember one thing: all four methods are trying to make a model pref
 
 | File | Method | Full Name | One-line idea |
 |------|--------|-----------|---------------|
+| [reward-model.md](reward-model.md) | **RM** | Reward Model | The scalar-scoring model PPO/GRPO optimize (read first) |
 | [01-ppo.md](01-ppo.md) | **PPO** | Proximal Policy Optimization | RL with a reward model + critic, clipped updates |
 | [02-dpo.md](02-dpo.md) | **DPO** | Direct Preference Optimization | Skip RL — optimize preferences as a classification loss |
 | [03-grpo.md](03-grpo.md) | **GRPO** | Group Relative Policy Optimization | RL without a critic — advantage from a group of samples |
 | [04-orpo.md](04-orpo.md) | **ORPO** | Odds Ratio Preference Optimization | Fold preference into SFT — no reference model at all |
 | [FAQ.md](FAQ.md) | — | — | Questions asked during learning, flagged for future use |
 
-**Suggested path:** PPO first (it defines the vocabulary — reward, KL, advantage, ratio, clipping — that everything else reuses or removes), then DPO (the big simplification), then GRPO (PPO minus the critic), then ORPO (the most stripped-down).
+**Suggested path:** the **reward model** first (it's the scalar signal PPO/GRPO maximize, and its loss shape recurs everywhere), then PPO (it defines the vocabulary — reward, KL, advantage, ratio, clipping — that everything else reuses or removes), then DPO (the big simplification), then GRPO (PPO minus the critic), then ORPO (the most stripped-down).
 
 ---
 
