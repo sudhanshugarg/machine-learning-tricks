@@ -24,6 +24,7 @@ This is a **living FAQ**. Any question raised while learning these methods — w
 | 6 | 2026-07-09 | Write down the equation for Q-learning. | `[ANSWERED]` | FAQ → Math Questions |
 | 7 | 2026-07-09 | What is temporal difference / TD learning? | `[ANSWERED]` | FAQ → Math Questions |
 | 8 | 2026-07-09 | What is "advantage" and why use it instead of raw reward? | `[ANSWERED]` | FAQ → Math Questions; [01-ppo.md](01-ppo.md) Step 4 |
+| 9 | 2026-07-09 | In PPO, who generates the responses being scored? Are there two responses like in DPO? | `[ANSWERED]` | FAQ → Implementation Questions |
 
 *(Append new rows as questions come in.)*
 
@@ -249,7 +250,34 @@ That last row is the punchline: **advantage is fundamentally about comparison to
 
 ## Implementation Questions
 
-*(none yet — add as they arise)*
+### Q: In PPO, who generates the responses being scored? Are there "two responses" like in DPO? `[ANSWERED]`
+
+**A:** No — there's **one response per prompt**, sampled from the **old policy** $\pi_{\theta_{\text{old}}}$.
+
+**The confusion:** DPO works with **preference pairs** (chosen vs. rejected responses from a fixed dataset). PPO works with **single samples** from the policy being trained, and the "old vs. new" refers to **two snapshots of the same policy at different times**, not two different responses.
+
+**PPO's generation:**
+
+```
+1. Take a snapshot of the current policy → π_θ_old
+2. For each prompt x in the batch:
+     Sample ONE response y ~ π_θ_old(· | x)
+3. Score it with the reward model r_φ(x, y) → one scalar per response
+4. Compute advantages, clipped surrogate loss
+5. Update the policy θ with several gradient steps
+6. Freeze the updated policy as the new π_θ_old for the next iteration
+```
+
+The "two policies" (old and new) are there to compute the **probability ratio** $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\theta_{\text{old}}}(a_t|s_t)$ — a measure of how far the update has moved. We take multiple gradient steps on $\pi_\theta$ while $\pi_{\theta_{\text{old}}}$ is frozen, so the ratio grows. Once the ratio gets too large (hits the clipping region), we stop and refreeze.
+
+**Contrast with DPO/GRPO:**
+- **DPO** = given a dataset of preference pairs (y_w, y_l), optimize the policy to rank them correctly. No generation during training.
+- **GRPO** = sample a **group** of $G$ responses per prompt (not just one), rank them by reward, use the group average as the baseline. Multiple samples per prompt.
+- **PPO** = sample one response per prompt, score it, estimate advantage (via a critic), update. Online and iterative.
+
+**Why one sample in PPO (not multiple)?** PPO is already expensive (4 models, online generation, multiple epochs). Sampling multiple responses per prompt would multiply the compute. You *could* do it (sometimes called "importance sampling" or "TRPO-style" multi-sample variants), but the standard PPO samples once and reuses it for $K$ epochs of gradient steps.
+
+*Pointer:* see [01-ppo.md](01-ppo.md) Step 1 (the online sampling loop) and the comparison table at the end.
 
 ---
 
