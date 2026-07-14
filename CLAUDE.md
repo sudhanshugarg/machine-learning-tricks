@@ -224,6 +224,11 @@ Use the template as a starting point for your implementation.
 - Use consistent templates for similar problem types
 - Maintain a table of contents in each module's README
 
+### Git Workflow
+- **After every change, automatically commit and push to main** — do not ask for confirmation
+- Commit message format: brief, present tense, what was added/changed (e.g., "Add knowledge distillation example", "Fix pruning algorithm explanation")
+- Include co-author in commit if pair programming: `Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>`
+
 ---
 
 ## Future Enhancements
