@@ -5903,7 +5903,532 @@ Safeguards:
 
 ---
 
-### Q: How do you approach debugging issues in a deployed ML system?
+### 5.2 Visualization & Dashboarding Tools
+
+**Q: What tools should you use to visualize metrics and create dashboards?**
+
+**Answer:**
+
+Real-time insights require good dashboarding. Different tools serve different purposes:
+
+#### 1. Real-Time Monitoring Dashboards
+
+**Grafana** (Most Popular)
+- Open-source, lightweight, highly customizable
+- Query multiple data sources (Prometheus, InfluxDB, Elasticsearch)
+- Auto-alerting based on thresholds
+- Good for: System health, latency, throughput
+
+```python
+# Example: Prometheus metrics exported to Grafana
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+import time
+
+class FraudDetectionMetrics:
+    def __init__(self):
+        # Counters: cumulative (never decrease)
+        self.predictions_total = Counter(
+            'fraud_predictions_total',
+            'Total predictions made',
+            ['decision']  # ALLOW, BLOCK, CHALLENGE
+        )
+        
+        # Histograms: distribution of values
+        self.prediction_latency = Histogram(
+            'fraud_prediction_latency_seconds',
+            'Prediction latency',
+            buckets=(0.01, 0.02, 0.05, 0.1, 0.2, 0.5)  # P50, P95, P99
+        )
+        
+        # Gauges: current value (can go up/down)
+        self.model_confidence = Gauge(
+            'fraud_model_confidence',
+            'Average model confidence',
+            ['model_version']
+        )
+        
+        self.feature_drift = Gauge(
+            'fraud_feature_drift',
+            'Feature drift detection',
+            ['feature_name']
+        )
+    
+    def record_prediction(self, decision, latency, confidence):
+        self.predictions_total.labels(decision=decision).inc()
+        self.prediction_latency.observe(latency)
+        self.model_confidence.set(confidence)
+
+# Start Prometheus scraper on port 8000
+start_http_server(8000)
+
+# Grafana queries to build dashboards:
+queries = {
+    'P99 Latency': 'histogram_quantile(0.99, fraud_prediction_latency_seconds)',
+    'Throughput (RPS)': 'rate(fraud_predictions_total[1m])',
+    'Decision Distribution': 'fraud_predictions_total',
+    'Model Confidence': 'fraud_model_confidence',
+    'Drift Alerts': 'fraud_feature_drift > 0.1'
+}
+```
+
+**DataDog** (Enterprise)
+- APM (Application Performance Monitoring)
+- Automatic instrumentation
+- Correlated logs, metrics, traces
+- Good for: End-to-end debugging, full observability
+
+```python
+# DataDog instrumentation
+from datadog import initialize, api
+from statsd import StatsClient
+
+options = {
+    'api_key': 'YOUR_API_KEY',
+    'app_key': 'YOUR_APP_KEY'
+}
+initialize(**options)
+
+statsd = StatsClient()
+
+@app.post("/predict")
+def predict(request):
+    start = time.time()
+    
+    try:
+        result = model.predict(request.features)
+        
+        # Log metric
+        statsd.gauge('fraud.prediction.confidence', result['confidence'])
+        statsd.increment('fraud.predictions.total', tags=[f"decision:{result['decision']}"])
+        
+        # Log trace
+        dd_trace_id = get_dd_trace_context()
+        log_event('fraud_prediction', {
+            'trace_id': dd_trace_id,
+            'confidence': result['confidence'],
+            'decision': result['decision']
+        })
+        
+    finally:
+        latency = time.time() - start
+        statsd.timing('fraud.prediction.latency', latency)
+```
+
+---
+
+#### 2. Python Visualization Libraries
+
+**Plotly** (Interactive, Web-ready)
+```python
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
+
+# Real-time performance dashboard
+def create_fraud_dashboard(metrics_df):
+    """
+    metrics_df columns: timestamp, latency_p50, latency_p99, 
+                       throughput, fraud_rate, model_confidence
+    """
+    
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=(
+            'Latency Percentiles',
+            'Throughput (RPS)',
+            'Fraud Rate',
+            'Model Confidence'
+        ),
+        specs=[
+            [{"secondary_y": False}, {"secondary_y": False}],
+            [{"secondary_y": False}, {"secondary_y": False}]
+        ]
+    )
+    
+    # Subplot 1: Latency percentiles
+    fig.add_trace(
+        go.Scatter(
+            x=metrics_df['timestamp'],
+            y=metrics_df['latency_p50'],
+            name='P50',
+            mode='lines'
+        ),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=metrics_df['timestamp'],
+            y=metrics_df['latency_p99'],
+            name='P99',
+            mode='lines',
+            fill='tonexty'
+        ),
+        row=1, col=1
+    )
+    
+    # Subplot 2: Throughput
+    fig.add_trace(
+        go.Bar(
+            x=metrics_df['timestamp'],
+            y=metrics_df['throughput'],
+            name='RPS',
+            marker_color='lightblue'
+        ),
+        row=1, col=2
+    )
+    
+    # Subplot 3: Fraud rate over time
+    fig.add_trace(
+        go.Scatter(
+            x=metrics_df['timestamp'],
+            y=metrics_df['fraud_rate'],
+            name='Fraud Rate',
+            mode='lines+markers',
+            line=dict(color='red')
+        ),
+        row=2, col=1
+    )
+    
+    # Subplot 4: Model confidence by decision
+    decisions = metrics_df.groupby('decision')['model_confidence'].mean()
+    fig.add_trace(
+        go.Bar(
+            x=decisions.index,
+            y=decisions.values,
+            name='Avg Confidence',
+            marker_color=['green', 'orange', 'red']
+        ),
+        row=2, col=2
+    )
+    
+    fig.update_yaxes(title_text="Latency (ms)", row=1, col=1)
+    fig.update_yaxes(title_text="RPS", row=1, col=2)
+    fig.update_yaxes(title_text="Fraud Rate", row=2, col=1)
+    fig.update_yaxes(title_text="Confidence", row=2, col=2)
+    
+    fig.update_layout(height=800, title_text="Fraud Detection System Dashboard")
+    fig.show()
+```
+
+**Matplotlib** (Static, publication-ready)
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+def create_model_comparison_report(baseline_metrics, current_metrics):
+    """Compare old vs new model"""
+    
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    
+    # Plot 1: Confusion Matrix Heatmap
+    from sklearn.metrics import confusion_matrix
+    cm = confusion_matrix(current_metrics['y_true'], current_metrics['y_pred'])
+    axes[0, 0].imshow(cm, cmap='Blues')
+    axes[0, 0].set_title('Confusion Matrix - New Model')
+    axes[0, 0].set_ylabel('True Label')
+    axes[0, 0].set_xlabel('Predicted Label')
+    
+    # Plot 2: ROC Curve
+    from sklearn.metrics import roc_curve, auc
+    fpr, tpr, _ = roc_curve(current_metrics['y_true'], current_metrics['y_score'])
+    roc_auc = auc(fpr, tpr)
+    axes[0, 1].plot(fpr, tpr, label=f'ROC curve (AUC = {roc_auc:.3f})')
+    axes[0, 1].plot([0, 1], [0, 1], 'k--', label='Random Classifier')
+    axes[0, 1].set_xlabel('False Positive Rate')
+    axes[0, 1].set_ylabel('True Positive Rate')
+    axes[0, 1].legend()
+    axes[0, 1].set_title('ROC Curve - New Model')
+    
+    # Plot 3: Precision-Recall Curve
+    from sklearn.metrics import precision_recall_curve, average_precision_score
+    precision, recall, _ = precision_recall_curve(
+        current_metrics['y_true'],
+        current_metrics['y_score']
+    )
+    ap = average_precision_score(current_metrics['y_true'], current_metrics['y_score'])
+    axes[1, 0].plot(recall, precision, label=f'AP = {ap:.3f}')
+    axes[1, 0].set_xlabel('Recall')
+    axes[1, 0].set_ylabel('Precision')
+    axes[1, 0].legend()
+    axes[1, 0].set_title('Precision-Recall Curve - New Model')
+    
+    # Plot 4: Metric Comparison
+    metrics = ['Precision', 'Recall', 'F1', 'AUC']
+    baseline_values = [
+        baseline_metrics['precision'],
+        baseline_metrics['recall'],
+        baseline_metrics['f1'],
+        baseline_metrics['auc']
+    ]
+    current_values = [
+        current_metrics['precision'],
+        current_metrics['recall'],
+        current_metrics['f1'],
+        current_metrics['auc']
+    ]
+    
+    x = np.arange(len(metrics))
+    width = 0.35
+    axes[1, 1].bar(x - width/2, baseline_values, width, label='Baseline')
+    axes[1, 1].bar(x + width/2, current_values, width, label='Current')
+    axes[1, 1].set_ylabel('Score')
+    axes[1, 1].set_title('Model Comparison')
+    axes[1, 1].set_xticks(x)
+    axes[1, 1].set_xticklabels(metrics)
+    axes[1, 1].legend()
+    
+    plt.tight_layout()
+    plt.savefig('model_comparison.png', dpi=300)
+```
+
+---
+
+#### 3. BI Tools for Business Insights
+
+**Apache Superset** (Open-source)
+- Fast, web-based visualization
+- SQL-based queries
+- Good for: Business metrics, fraud trends, customer impact
+
+```python
+# Superset SQL queries for fraud dashboard
+
+queries = {
+    'Daily Fraud Volume': '''
+        SELECT date, COUNT(*) as transaction_count, 
+               SUM(CASE WHEN is_fraud=1 THEN 1 ELSE 0 END) as fraud_count
+        FROM transactions
+        GROUP BY date
+        ORDER BY date DESC
+    ''',
+    
+    'Fraud Rate by Merchant Category': '''
+        SELECT category, 
+               COUNT(*) as txns,
+               SUM(CASE WHEN is_fraud=1 THEN 1 ELSE 0 END) as frauds,
+               100.0 * SUM(CASE WHEN is_fraud=1 THEN 1 ELSE 0 END) / COUNT(*) as fraud_rate
+        FROM transactions
+        GROUP BY category
+        ORDER BY fraud_rate DESC
+    ''',
+    
+    'Model Performance Over Time': '''
+        SELECT DATE_TRUNC('day', timestamp) as date,
+               COUNT(*) as predictions,
+               SUM(CASE WHEN prediction = is_fraud THEN 1 ELSE 0 END) / COUNT(*) as accuracy,
+               SUM(CASE WHEN prediction=1 AND is_fraud=1 THEN 1 ELSE 0 END) / 
+               SUM(CASE WHEN is_fraud=1 THEN 1 ELSE 0 END) as recall
+        FROM predictions
+        WHERE model_version = 'v2'
+        GROUP BY DATE_TRUNC('day', timestamp)
+    '''
+}
+```
+
+**Tableau/Looker** (Enterprise)
+- Beautiful, interactive dashboards
+- Row-level security
+- Good for: Executive reporting, stakeholder communication
+
+---
+
+#### 4. ML-Specific Tracking Tools
+
+**Weights & Biases** (ML Experiment Tracking)
+```python
+import wandb
+
+wandb.init(project="fraud-detection", name="experiment-v2")
+
+# Log metrics during training
+for epoch in range(10):
+    metrics = train_epoch()
+    wandb.log({
+        'loss': metrics['loss'],
+        'auc': metrics['auc'],
+        'precision': metrics['precision'],
+        'recall': metrics['recall'],
+        'epoch': epoch
+    })
+
+# Log model artifacts
+wandb.save('model.pkl')
+
+# Create custom charts
+wandb.log({
+    "confusion_matrix": wandb.plot.confusion_matrix(
+        y_true=y_test,
+        preds=predictions,
+        class_names=['Not Fraud', 'Fraud']
+    ),
+    "roc": wandb.plot.roc_curve(y_test, y_scores)
+})
+
+wandb.finish()
+```
+
+**MLflow UI** (Model Registry & Tracking)
+```python
+import mlflow
+
+mlflow.set_experiment("fraud-detection")
+
+with mlflow.start_run():
+    model = train_model(X_train, y_train)
+    
+    # Log parameters
+    mlflow.log_params({
+        'max_depth': 6,
+        'learning_rate': 0.1,
+        'n_estimators': 100
+    })
+    
+    # Log metrics
+    mlflow.log_metrics({
+        'auc': 0.95,
+        'precision': 0.92,
+        'recall': 0.93
+    })
+    
+    # Log model
+    mlflow.sklearn.log_model(model, "fraud-model")
+    
+    # Register model
+    mlflow.register_model(f"runs:/{mlflow.active_run().info.run_id}/fraud-model", "fraud-v2")
+
+# Access MLflow UI at: http://localhost:5000
+```
+
+---
+
+#### 5. Comprehensive Monitoring Stack
+
+```
+┌─────────────────────────────────────────────┐
+│         Your Fraud Detection System          │
+└──────────┬──────────────────────────────────┘
+           │
+           ├─→ Prometheus (scrape metrics)
+           │
+           ├─→ Elasticsearch (logs)
+           │
+           └─→ MLflow (model tracking)
+                      │
+                      ├─→ Grafana (real-time dashboard)
+                      ├─→ Kibana (log analysis)
+                      └─→ MLflow UI (model registry)
+```
+
+**Setup Example:**
+```docker
+# docker-compose.yml for monitoring stack
+version: '3'
+services:
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+  
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+  
+  mlflow:
+    image: python:3.9
+    command: pip install mlflow && mlflow ui --host 0.0.0.0
+    ports:
+      - "5000:5000"
+  
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.14.0
+    environment:
+      - discovery.type=single-node
+    ports:
+      - "9200:9200"
+  
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.14.0
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+```
+
+---
+
+#### 6. Dashboard Checklist
+
+**Real-time Monitoring Dashboard (Update every 1 min):**
+- [ ] P50, P95, P99 latency with alert threshold (100ms)
+- [ ] Throughput (RPS) with capacity limit
+- [ ] Error rate with alert threshold (>0.1%)
+- [ ] Model confidence distribution
+- [ ] Decision distribution (ALLOW/BLOCK/CHALLENGE counts)
+- [ ] Feature drift indicators (>2σ alert)
+- [ ] Model version running (v1, v2, canary %)
+
+**Daily Performance Report (Update every 24 hours):**
+- [ ] Precision, Recall, F1, AUC vs baseline
+- [ ] Fraud catch rate vs false positive rate
+- [ ] Confusion matrix (True Positives, False Positives, etc.)
+- [ ] ROC and Precision-Recall curves
+- [ ] Model retraining status (success/failure)
+- [ ] Data quality metrics (missing values, outliers)
+
+**Business Metrics Dashboard:**
+- [ ] Fraud volume and trend
+- [ ] Fraud rate by merchant category
+- [ ] Fraud losses prevented
+- [ ] Customer friction (false positives)
+- [ ] Model accuracy by transaction amount
+- [ ] Geographic fraud patterns
+
+---
+
+#### Tool Selection Guide
+
+```
+CHOOSE GRAFANA IF:
+  ✓ Need real-time metrics monitoring
+  ✓ Want open-source solution
+  ✓ Already using Prometheus
+  ✓ Team is ops/DevOps heavy
+
+CHOOSE DATADOG IF:
+  ✓ Need end-to-end observability
+  ✓ Enterprise support important
+  ✓ Want automatic instrumentation
+  ✓ Budget is available
+
+CHOOSE SUPERSET IF:
+  ✓ Need SQL-based business queries
+  ✓ Want open-source BI
+  ✓ Data lives in data warehouse
+  ✓ Business stakeholders need access
+
+CHOOSE WEIGHTS & BIASES IF:
+  ✓ Tracking many ML experiments
+  ✓ Need reproducibility
+  ✓ Collaborating across teams
+  ✓ Want built-in model comparison
+
+CHOOSE MLFLOW IF:
+  ✓ Need model registry
+  ✓ Multiple models in production
+  ✓ Version control for models
+  ✓ Open-source preference
+```
+
+---
+
+
 
 **Answer:**
 
