@@ -5911,7 +5911,521 @@ Safeguards:
 
 Real-time insights require good dashboarding. Different tools serve different purposes:
 
-#### 1. Real-Time Monitoring Dashboards
+#### Understanding Prometheus Metrics: Counters vs Gauges vs Histograms
+
+Before exploring dashboarding tools, understand the three fundamental metric types in Prometheus:
+
+**1. COUNTERS (Always Increase)**
+
+Counters only go up, never reset or decrease. Perfect for counting cumulative events.
+
+```python
+from prometheus_client import Counter
+
+# Define counter
+predictions_total = Counter(
+    'fraud_predictions_total',
+    'Total predictions made',
+    ['decision']  # Labels: ALLOW, BLOCK, CHALLENGE
+)
+
+# Usage - ALWAYS INCREMENTS
+predictions_total.labels(decision='ALLOW').inc()          # Increment by 1
+predictions_total.labels(decision='BLOCK').inc(2)         # Increment by 2
+# predictions_total.labels(decision='ALLOW').dec()        # ERROR! Can't decrement
+
+# What happens over time:
+# 10:00: ALLOW=100, BLOCK=50, CHALLENGE=30
+# 10:01: ALLOW=150, BLOCK=65, CHALLENGE=45  (only increases)
+# 10:02: ALLOW=200, BLOCK=80, CHALLENGE=60
+```
+
+**When to use Counters:**
+```
+✓ Total requests
+✓ Total errors
+✓ Total transactions processed
+✓ Total frauds detected
+✓ Total times feature failed
+
+✗ NOT for: Current values (like active requests)
+✗ NOT for: Values that go down
+✗ NOT for: Percentages
+```
+
+**Prometheus Queries for Counters:**
+```
+# Raw counter value (cumulative since server started)
+fraud_predictions_total{decision="BLOCK"}
+Result: 1,250,000 (total blocks since start)
+
+# Per-second rate (how fast is it increasing?)
+rate(fraud_predictions_total[1m])          # Average per second over last 1 min
+Result: 12.5 (predictions per second)
+
+# Which decision is most common?
+sum(rate(fraud_predictions_total[1m])) by (decision)
+ALLOW:     8.3 predictions/sec
+BLOCK:     2.1 predictions/sec
+CHALLENGE: 2.1 predictions/sec
+
+# Per-minute rate (better for slower-moving metrics)
+rate(fraud_predictions_total[5m]) * 60
+Result: 750 predictions per minute
+```
+
+**Real Fraud Detection Example:**
+```python
+# Log predictions by decision
+predictions_total = Counter(
+    'fraud_predictions_total',
+    'Total predictions by decision',
+    ['decision', 'model_version']
+)
+
+@app.post("/predict")
+def predict(request):
+    score = model.predict(request.features)
+    
+    if score > 0.8:
+        decision = 'BLOCK'
+    elif score > 0.5:
+        decision = 'CHALLENGE'
+    else:
+        decision = 'ALLOW'
+    
+    predictions_total.labels(
+        decision=decision,
+        model_version='v2'
+    ).inc()
+    
+    return decision
+
+# Prometheus query: How many blocks per minute?
+# rate(fraud_predictions_total{decision="BLOCK"}[1m]) * 60
+# Shows: 25 blocks per minute (25 frauds caught per minute!)
+```
+
+---
+
+**2. GAUGES (Current Value, Can Go Up or Down)**
+
+Gauges represent current state. They can increase, decrease, or stay the same.
+
+```python
+from prometheus_client import Gauge
+
+# Define gauges
+model_confidence = Gauge(
+    'fraud_model_confidence',
+    'Current model confidence',
+    ['model_version']
+)
+
+active_requests = Gauge(
+    'fraud_active_requests',
+    'Currently processing requests'
+)
+
+feature_drift = Gauge(
+    'fraud_feature_drift_zscore',
+    'Feature drift in standard deviations',
+    ['feature_name']
+)
+
+# Usage - CAN GO UP AND DOWN
+active_requests.inc()                              # Started processing
+# ... do work ...
+active_requests.dec()                              # Finished processing
+
+model_confidence.labels(model_version='v2').set(0.92)  # Set to 92%
+model_confidence.labels(model_version='v2').set(0.89)  # Update to 89%
+
+feature_drift.labels(feature_name='txn_amount').set(1.5)   # 1.5 sigma drift
+feature_drift.labels(feature_name='merchant_id').set(0.2)  # 0.2 sigma drift
+
+# What happens over time:
+# 10:00: active_requests=15, confidence=0.92
+# 10:01: active_requests=22, confidence=0.91
+# 10:02: active_requests=18, confidence=0.90
+# (values can go up OR down)
+```
+
+**When to use Gauges:**
+```
+✓ Current queue depth
+✓ Active connections
+✓ Memory usage
+✓ Model confidence
+✓ Feature drift scores
+✓ Fraud rate right now
+✓ Current temperature/load
+
+✗ NOT for: Cumulative totals
+✗ NOT for: Monotonically increasing values
+```
+
+**Prometheus Queries for Gauges:**
+```
+# Current value right now
+fraud_model_confidence{model_version="v2"}
+Result: 0.92 (model is 92% confident)
+
+# Average over last 5 minutes
+avg_over_time(fraud_model_confidence[5m])
+Result: 0.91 (average confidence)
+
+# Maximum drift detected
+max(fraud_feature_drift_zscore)
+Result: 2.3 (some feature drifted 2.3 sigma!)
+
+# Alert if any feature drifted >2 sigma
+fraud_feature_drift_zscore > 2
+Fires alert!
+```
+
+**Real Fraud Detection Example:**
+```python
+# Track current system state
+active_requests = Gauge('fraud_active_requests', 'Active requests')
+model_confidence = Gauge('fraud_model_confidence', 'Average confidence', ['decision'])
+feature_drift = Gauge('fraud_feature_drift', 'Feature drift', ['feature'])
+
+@app.post("/predict")
+def predict(request):
+    active_requests.inc()  # Request started
+    
+    try:
+        score = model.predict(request.features)
+        confidence = score if score > 0.5 else (1 - score)
+        
+        if score > 0.8:
+            decision = 'BLOCK'
+        elif score > 0.5:
+            decision = 'CHALLENGE'
+        else:
+            decision = 'ALLOW'
+        
+        model_confidence.labels(decision=decision).set(confidence)
+        
+    finally:
+        active_requests.dec()  # Request finished
+
+# Background task: Check feature drift
+def monitor_features():
+    while True:
+        for feature in ['txn_amount', 'merchant_category', 'user_velocity']:
+            drift_zscore = compute_drift(feature)
+            feature_drift.labels(feature=feature).set(drift_zscore)
+        time.sleep(60)
+
+# Prometheus query: How many requests are active RIGHT NOW?
+fraud_active_requests
+Result: 42 (42 requests being processed)
+
+# Alert if active requests > 100 (capacity)
+fraud_active_requests > 100
+Fires: "Too many active requests!"
+```
+
+---
+
+**3. HISTOGRAMS (Distribution Over Buckets)**
+
+Histograms track distribution of values in predefined buckets. Useful for latency, request sizes, response times.
+
+```python
+from prometheus_client import Histogram
+
+# Define histogram with buckets
+prediction_latency = Histogram(
+    'fraud_prediction_latency_seconds',
+    'Prediction latency in seconds',
+    buckets=(0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
+    # Buckets: <10ms, <20ms, <50ms, <100ms, <200ms, <500ms, <1000ms
+)
+
+model_confidence_dist = Histogram(
+    'fraud_model_confidence',
+    'Model confidence distribution',
+    buckets=(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
+)
+
+# Usage - OBSERVE VALUES
+import time
+
+start = time.time()
+score = model.predict(features)
+latency = time.time() - start
+
+prediction_latency.observe(latency)           # Record latency
+model_confidence_dist.observe(score)          # Record confidence
+
+# What Prometheus creates automatically:
+# _bucket metrics (cumulative count up to bucket)
+# _sum (sum of all observed values)
+# _count (count of observations)
+
+# Example: After 1000 predictions
+fraud_prediction_latency_seconds_bucket{le="0.01"}   = 50    (50 < 10ms)
+fraud_prediction_latency_seconds_bucket{le="0.02"}   = 120   (120 < 20ms)
+fraud_prediction_latency_seconds_bucket{le="0.05"}   = 350   (350 < 50ms)
+fraud_prediction_latency_seconds_bucket{le="0.1"}    = 800   (800 < 100ms)
+fraud_prediction_latency_seconds_bucket{le="0.5"}    = 950   (950 < 500ms)
+fraud_prediction_latency_seconds_bucket{le="+Inf"}   = 1000  (all 1000)
+fraud_prediction_latency_seconds_sum                 = 45.3  (total seconds)
+fraud_prediction_latency_seconds_count               = 1000
+```
+
+**When to use Histograms:**
+```
+✓ Request latency
+✓ Response sizes
+✓ Processing times
+✓ Model confidence scores
+✓ Feature values distribution
+✓ Anything you want percentiles for
+
+✗ NOT for: Simple binary yes/no (use counter)
+✗ NOT for: Current state (use gauge)
+```
+
+**Prometheus Queries for Histograms:**
+```
+# Calculate percentiles (P50, P95, P99)
+histogram_quantile(0.50, rate(fraud_prediction_latency_seconds_bucket[5m]))
+Result: 0.032 (median latency is 32ms)
+
+histogram_quantile(0.95, rate(fraud_prediction_latency_seconds_bucket[5m]))
+Result: 0.085 (95% of requests finish in 85ms)
+
+histogram_quantile(0.99, rate(fraud_prediction_latency_seconds_bucket[5m]))
+Result: 0.18 (99% of requests finish in 180ms)
+
+# Average latency (sum / count)
+rate(fraud_prediction_latency_seconds_sum[5m]) / rate(fraud_prediction_latency_seconds_count[5m])
+Result: 0.045 (average latency is 45ms)
+
+# How many predictions per second?
+rate(fraud_prediction_latency_seconds_count[1m])
+Result: 12.5 (12.5 predictions per second)
+```
+
+**Real Fraud Detection Example:**
+```python
+prediction_latency = Histogram(
+    'fraud_prediction_latency_seconds',
+    'How long does prediction take?',
+    buckets=(0.01, 0.02, 0.05, 0.1, 0.2)
+)
+
+feature_lookup_latency = Histogram(
+    'fraud_feature_lookup_latency_seconds',
+    'How long to fetch features?',
+    buckets=(0.005, 0.01, 0.02, 0.05, 0.1)
+)
+
+@app.post("/predict")
+def predict(request):
+    # Time feature lookup
+    start_features = time.time()
+    features = feature_store.get(request.user_id)
+    feature_lookup_latency.observe(time.time() - start_features)
+    
+    # Time model scoring
+    start_model = time.time()
+    score = model.predict(features)
+    prediction_latency.observe(time.time() - start_model)
+    
+    return decision
+
+# Prometheus queries for debugging:
+# "Why are some predictions slow?"
+histogram_quantile(0.99, rate(fraud_prediction_latency_seconds_bucket[5m]))
+# Returns: 0.18 (P99 = 180ms, exceeds our 100ms budget!)
+
+# "Is it the model or feature lookup?"
+histogram_quantile(0.99, rate(fraud_feature_lookup_latency_seconds_bucket[5m]))
+# Returns: 0.08 (feature lookup is only 80ms)
+# So model scoring is taking 100ms! (180 - 80 = 100ms)
+```
+
+---
+
+#### Comparison Table: Counters vs Gauges vs Histograms
+
+```
+Property           | Counter          | Gauge            | Histogram
+-------------------|------------------|------------------|------------------
+Direction          | Only increases   | Up or down       | Distribution
+Use case           | Cumulative count | Current value    | Percentiles
+Example 1          | Total errors     | Active requests  | Latency
+Example 2          | Total fraud      | Queue depth      | Request size
+Example 3          | Total blocked    | Memory usage     | Model confidence
+Reset behavior     | Never resets     | Can change anytime| Buckets accumulate
+
+Query for rate     | rate(counter)    | gauge directly   | rate(bucket) → quantile
+Query for total    | counter directly | N/A              | _sum / _count
+Alert threshold    | rate > X         | value > X        | quantile > X
+
+Real use:
+  Fraud total      | Counter          |                  |
+  Active requests  |                  | Gauge            |
+  Latency P99      |                  |                  | Histogram
+  Fraud rate now   |                  | Gauge            | OR histogram
+  Feature drift    |                  | Gauge            |
+  Model confidence |                  | Gauge            | Histogram (distribution)
+```
+
+---
+
+#### Complete Fraud Detection Monitoring Setup
+
+```python
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
+
+class FraudMonitoring:
+    def __init__(self):
+        # COUNTERS (cumulative)
+        self.predictions_total = Counter(
+            'fraud_predictions_total',
+            'Total predictions',
+            ['decision', 'model_version']
+        )
+        
+        self.errors_total = Counter(
+            'fraud_errors_total',
+            'Total errors',
+            ['error_type']
+        )
+        
+        self.frauds_detected_total = Counter(
+            'fraud_frauds_detected_total',
+            'Total frauds detected'
+        )
+        
+        # GAUGES (current state)
+        self.active_requests = Gauge(
+            'fraud_active_requests',
+            'Active prediction requests'
+        )
+        
+        self.model_confidence = Gauge(
+            'fraud_model_confidence',
+            'Average model confidence',
+            ['decision']
+        )
+        
+        self.feature_drift = Gauge(
+            'fraud_feature_drift_sigma',
+            'Feature drift in standard deviations',
+            ['feature_name']
+        )
+        
+        self.queue_depth = Gauge(
+            'fraud_queue_depth',
+            'Pending predictions in queue'
+        )
+        
+        # HISTOGRAMS (distributions)
+        self.prediction_latency = Histogram(
+            'fraud_prediction_latency_seconds',
+            'Prediction latency',
+            buckets=(0.01, 0.02, 0.05, 0.1, 0.2, 0.5)
+        )
+        
+        self.feature_lookup_latency = Histogram(
+            'fraud_feature_lookup_latency_seconds',
+            'Feature store lookup latency',
+            buckets=(0.005, 0.01, 0.02, 0.05, 0.1)
+        )
+        
+        self.model_confidence_dist = Histogram(
+            'fraud_model_confidence_dist',
+            'Model confidence distribution',
+            buckets=(0.5, 0.6, 0.7, 0.8, 0.9, 0.95)
+        )
+
+    def record_prediction(self, decision, latency, confidence, model_version='v2'):
+        # Counter: increment totals
+        self.predictions_total.labels(decision=decision, model_version=model_version).inc()
+        
+        if decision == 'BLOCK':
+            self.frauds_detected_total.inc()
+        
+        # Histogram: record distributions
+        self.prediction_latency.observe(latency)
+        self.model_confidence_dist.observe(confidence)
+        self.model_confidence.labels(decision=decision).set(confidence)
+
+    def request_started(self):
+        self.active_requests.inc()
+        self.queue_depth.inc()
+    
+    def request_finished(self, feature_lookup_latency):
+        self.active_requests.dec()
+        self.queue_depth.dec()
+        self.feature_lookup_latency.observe(feature_lookup_latency)
+    
+    def record_error(self, error_type):
+        self.errors_total.labels(error_type=error_type).inc()
+    
+    def update_feature_drift(self, feature_name, zscore):
+        self.feature_drift.labels(feature_name=feature_name).set(zscore)
+
+# Usage
+monitoring = FraudMonitoring()
+start_http_server(8000)  # Prometheus scrapes http://localhost:8000/metrics
+
+@app.post("/predict")
+def predict(request):
+    monitoring.request_started()
+    
+    try:
+        start = time.time()
+        features = feature_store.get(request.user_id)
+        feature_lookup_time = time.time() - start
+        
+        start = time.time()
+        score = model.predict(features)
+        prediction_time = time.time() - start
+        
+        confidence = score if score > 0.5 else (1 - score)
+        decision = 'BLOCK' if score > 0.8 else ('CHALLENGE' if score > 0.5 else 'ALLOW')
+        
+        monitoring.record_prediction(decision, prediction_time, confidence)
+        
+        return decision
+        
+    except Exception as e:
+        monitoring.record_error(type(e).__name__)
+        raise
+    finally:
+        monitoring.request_finished(feature_lookup_time)
+
+# Prometheus queries:
+# 1. How many predictions per second by decision?
+rate(fraud_predictions_total[1m]) by (decision)
+
+# 2. What's the fraud detection rate (blocks per minute)?
+rate(fraud_frauds_detected_total[1m]) * 60
+
+# 3. How many requests active right now?
+fraud_active_requests
+
+# 4. P99 latency and alert if > 100ms?
+histogram_quantile(0.99, rate(fraud_prediction_latency_seconds_bucket[5m])) > 0.1
+
+# 5. Is feature drifting?
+fraud_feature_drift_sigma > 2
+
+# 6. Average vs P95 confidence
+avg(fraud_model_confidence_dist) vs histogram_quantile(0.95, fraud_model_confidence_dist)
+```
+
+---
+
+
 
 **Grafana** (Most Popular)
 - Open-source, lightweight, highly customizable
