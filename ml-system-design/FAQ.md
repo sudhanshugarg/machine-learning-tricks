@@ -4,9 +4,49 @@ This FAQ addresses common questions across ML system design problems. These are 
 
 ---
 
+## Table of Contents
+
+### 1. Data Pipeline
+- [1.1 Data Quality Issues](#11-data-quality-issues)
+- [1.2 Handling Data Issues](#12-handling-data-issues)
+- [1.3 Data Freshness](#13-data-freshness)
+- [1.4 Oversampling vs Undersampling](#14-oversampling-vs-undersampling)
+- [1.5 Probability Calibration with Resampling](#15-probability-calibration-with-resampling)
+- [1.6 Why Weights Don't Need Calibration](#16-why-weights-dont-need-calibration)
+
+### 2. Data Processing & Feature Engineering
+- [2.1 Scalable Data Processing Pipelines](#21-scalable-data-processing-pipelines)
+
+### 3. Data Versioning & Management
+- [3.1 Importance of Data Versioning](#31-importance-of-data-versioning)
+- [3.2 Managing Large Datasets](#32-managing-large-datasets)
+- [3.3 Data Lineage & Reproducibility](#33-data-lineage--reproducibility)
+
+### 4. Model Training
+- [4.1 Cross-Validation](#41-cross-validation)
+- [4.2 Weighted Cross-Entropy Loss](#42-weighted-cross-entropy-loss)
+
+### 5. Model Deployment & Serving
+- [5.1 Deployment Architectures](#51-deployment-architectures)
+- [5.2 Choosing Deployment Architecture](#52-choosing-deployment-architecture)
+- [5.3 Model Optimization](#53-model-optimization)
+- [5.4 Scaling Model Serving](#54-scaling-model-serving)
+
+### 6. Monitoring & Maintenance
+- [6.1 Key Metrics to Monitor](#61-key-metrics-to-monitor)
+- [6.2 Model Retraining Strategies](#62-model-retraining-strategies)
+- [6.3 Debugging ML Systems](#63-debugging-ml-systems)
+
+### 7. Industry Tools & Technologies
+- [7.1 ML System Design Tools](#71-ml-system-design-tools)
+
+---
+
 ## 1. Data Pipeline
 
-### Q: Can you identify potential data quality issues?
+### 1.1 Data Quality Issues
+
+**Q: Can you identify potential data quality issues?**
 
 **Answer:**
 
@@ -85,7 +125,9 @@ model.fit(X_train, y_train, sample_weight=...)
 
 ---
 
-### Q: How exactly do you implement oversampling vs undersampling? What do you modify in model.fit() and loss functions?
+### 1.4 Oversampling vs Undersampling
+
+**Q: How exactly do you implement oversampling vs undersampling?** What do you modify in model.fit() and loss functions?
 
 **Answer:**
 
@@ -358,7 +400,9 @@ model.evaluate(X_test, y_test)  # Evaluated on real distribution
 
 ---
 
-### Q: When we oversample/undersample, don't the predicted probabilities become miscalibrated? How do we correct for this?
+### 1.5 Probability Calibration with Resampling
+
+**Q: When we oversample/undersample, don't the predicted probabilities become miscalibrated?** How do we correct for this?
 
 **Answer:**
 
@@ -712,7 +756,9 @@ model.fit(X_train, y_train)
 
 ---
 
-### Q: What exactly is cross-validation and why do we need it?
+### 4.1 Cross-Validation
+
+**Q: What exactly is cross-validation and why do we need it?**
 
 **Answer:**
 
@@ -1104,7 +1150,9 @@ df = df[df['amount'] < 1_000_000]  # Upper bound check
 
 ---
 
-### Q: How do you propose appropriate techniques for handling data issues?
+### 1.2 Handling Data Issues
+
+**Q: How do you propose appropriate techniques for handling data issues?**
 
 **Answer:**
 
@@ -1144,7 +1192,9 @@ X_test_scaled = scaler.transform(X_test)
 
 ---
 
-### Q: How do you ensure data freshness in ML systems?
+### 1.3 Data Freshness
+
+**Q: How do you ensure data freshness in ML systems?**
 
 **Answer:**
 
@@ -1385,7 +1435,9 @@ def validate_features(features_df):
 
 ## 3. Data Versioning & Management
 
-### Q: Why is data versioning important?
+### 3.1 Importance of Data Versioning
+
+**Q: Why is data versioning important?**
 
 **Answer:**
 
@@ -1414,7 +1466,9 @@ v3 (2024-01-15): Different cleaning → Train → Model C (96% AUC) ✓
 
 ---
 
-### Q: How do you manage large datasets and their versions?
+### 3.2 Managing Large Datasets
+
+**Q: How do you manage large datasets and their versions?**
 
 **Answer:**
 
@@ -1500,7 +1554,9 @@ Data versioning strategy:
 
 ---
 
-### Q: How do you track data lineage and ensure reproducibility?
+### 3.3 Data Lineage & Reproducibility
+
+**Q: How do you track data lineage and ensure reproducibility?**
 
 **Answer:**
 
@@ -1581,7 +1637,9 @@ def train_and_log():
 
 ## 4. Model Deployment & Serving
 
-### Q: What are the trade-offs between different deployment architectures?
+### 5.1 Deployment Architectures
+
+**Q: What are the trade-offs between different deployment architectures?**
 
 **Answer:**
 
@@ -1701,7 +1759,9 @@ Online request:
 
 ---
 
-### Q: How do you choose the right deployment architecture?
+### 5.2 Choosing Deployment Architecture
+
+**Q: How do you choose the right deployment architecture?**
 
 **Answer:**
 
@@ -1830,7 +1890,9 @@ Choose Option 3 (best accuracy/latency tradeoff)
 
 ---
 
-### Q: How do you scale model serving for varying workloads?
+### 5.4 Scaling Model Serving
+
+**Q: How do you scale model serving for varying workloads?
 
 **Answer:**
 
@@ -1962,7 +2024,9 @@ Effect: Fewer servers needed (faster inference)
 
 ## 5. Monitoring & Maintenance
 
-### Q: What metrics should you monitor?
+### 6.1 Key Metrics to Monitor
+
+**Q: What metrics should you monitor?**
 
 **Answer:**
 
@@ -2070,7 +2134,9 @@ def check_label_drift():
 
 ---
 
-### Q: What are best practices for model retraining?
+### 6.2 Model Retraining Strategies
+
+**Q: What are best practices for model retraining?**
 
 **Answer:**
 
@@ -2384,7 +2450,9 @@ def score_transaction(transaction):
 
 ## 6. Industry-Standard Tools
 
-### Q: Which tools should you use for ML system design?
+### 7.1 ML System Design Tools
+
+**Q: Which tools should you use for ML system design?**
 
 **Answer:**
 
@@ -2499,7 +2567,9 @@ def score_transaction(transaction):
 
 ---
 
-### Q: How exactly are weights used in the cross-entropy loss function? Can you walk through a concrete numerical example?
+### 4.2 Weighted Cross-Entropy Loss
+
+**Q: How exactly are weights used in the cross-entropy loss function?** Can you walk through a concrete numerical example?
 
 **Answer:**
 
@@ -2863,7 +2933,9 @@ model.fit(X_train, y_train)
 
 ---
 
-### Q: Why don't weighted losses require calibration during inference like resampling does?
+### 1.6 Why Weights Don't Need Calibration
+
+**Q: Why don't weighted losses require calibration during inference like resampling does?
 
 **Answer:**
 
