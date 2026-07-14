@@ -5240,7 +5240,519 @@ def check_label_drift():
 
 ---
 
-### 5.2 Model Retraining Strategies
+### 5.1b Advanced Data Drift Detection
+
+**Q: How do you detect data drift beyond just monitoring the mean?**
+
+**Answer:**
+
+The mean only captures central tendency and only works for numeric features. Real data drift detection requires monitoring distributions, handling categorical/embedding features, and using statistical tests.
+
+#### Techniques for Numeric Features
+
+**1. Statistical Distribution Tests**
+
+Beyond the mean, monitor the full distribution:
+
+```python
+import numpy as np
+from scipy.stats import ks_2samp, wasserstein_distance, entropy
+
+class NumericDriftDetector:
+    def __init__(self, baseline_data, alert_threshold=0.05):
+        self.baseline = baseline_data
+        self.threshold = alert_threshold
+    
+    # Technique 1: Kolmogorov-Smirnov (KS) Test
+    def ks_test(self, current_data):
+        """
+        Compare empirical distributions.
+        KS statistic = max difference between CDFs
+        p-value: how likely this difference occurred by chance
+        """
+        ks_stat, p_value = ks_2samp(self.baseline, current_data)
+        
+        # KS stat: 0 = identical, 1 = completely different
+        # p-value < 0.05: statistically significant drift
+        
+        return {
+            'ks_statistic': ks_stat,      # 0 to 1 (0=same, 1=different)
+            'p_value': p_value,             # < 0.05 = drift detected
+            'drifted': p_value < self.threshold
+        }
+    
+    # Technique 2: Wasserstein Distance
+    def wasserstein_distance(self, current_data):
+        """
+        Measures how much probability mass needs to move
+        to transform baseline into current.
+        In fraud detection: literally the cost to go from old to new
+        """
+        distance = wasserstein_distance(self.baseline, current_data)
+        
+        # Interpret: how different are the distributions?
+        # Same scale as the data (money amount, transaction count, etc.)
+        
+        return {
+            'wasserstein_distance': distance,
+            'drifted': distance > np.percentile(self.baseline, 75)
+        }
+    
+    # Technique 3: Percentile Monitoring
+    def percentile_drift(self, current_data, percentiles=[25, 50, 75, 95]):
+        """
+        Monitor distribution shape via percentiles
+        Catches drift in tails (where fraudsters live!)
+        """
+        baseline_percentiles = {
+            p: np.percentile(self.baseline, p)
+            for p in percentiles
+        }
+        current_percentiles = {
+            p: np.percentile(current_data, p)
+            for p in percentiles
+        }
+        
+        # Alert if any percentile shifted significantly
+        drift_detected = False
+        for p in percentiles:
+            pct_change = abs(
+                (current_percentiles[p] - baseline_percentiles[p]) / 
+                (baseline_percentiles[p] + 1e-6)
+            )
+            if pct_change > 0.2:  # 20% change
+                drift_detected = True
+                print(f"P{p} drifted: {baseline_percentiles[p]:.2f} → {current_percentiles[p]:.2f}")
+        
+        return {
+            'baseline_percentiles': baseline_percentiles,
+            'current_percentiles': current_percentiles,
+            'drifted': drift_detected
+        }
+    
+    # Technique 4: Jensen-Shannon Divergence (Discrete)
+    def js_divergence(self, current_data, bins=20):
+        """
+        Measure divergence between two distributions
+        JS = 0 (identical) to JS = 1 (completely different)
+        """
+        # Digitize into bins
+        baseline_hist, bin_edges = np.histogram(self.baseline, bins=bins)
+        current_hist, _ = np.histogram(current_data, bins=bin_edges)
+        
+        # Normalize to probabilities
+        p = baseline_hist / baseline_hist.sum()
+        q = current_hist / current_hist.sum()
+        
+        # JS divergence = sqrt of Jensen-Shannon distance
+        m = 0.5 * (p + q)
+        js = 0.5 * entropy(p, m) + 0.5 * entropy(q, m)
+        
+        return {
+            'js_divergence': js,  # 0 to log(2)
+            'drifted': js > 0.1   # Threshold
+        }
+
+# Example usage
+baseline_txn_amounts = np.array([10, 20, 15, 50, 100, 75, 30, 40, 25, 35])
+current_txn_amounts = np.array([5, 10, 8, 200, 300, 250, 15, 20, 12, 18])  # Shifted to larger amounts
+
+detector = NumericDriftDetector(baseline_txn_amounts)
+
+print("KS Test:")
+print(detector.ks_test(current_txn_amounts))
+
+print("\nWasserstein Distance:")
+print(detector.wasserstein_distance(current_txn_amounts))
+
+print("\nPercentile Drift:")
+print(detector.percentile_drift(current_txn_amounts))
+
+print("\nJS Divergence:")
+print(detector.js_divergence(current_txn_amounts))
+```
+
+---
+
+#### Techniques for Categorical Features
+
+Categorical features require different approaches — can't use percentiles!
+
+```python
+from scipy.stats import chi2_contingency
+from sklearn.preprocessing import LabelEncoder
+
+class CategoricalDriftDetector:
+    def __init__(self, baseline_data):
+        self.baseline = baseline_data
+        self.baseline_dist = self._get_distribution(baseline_data)
+    
+    def _get_distribution(self, data):
+        """Get category frequencies"""
+        unique, counts = np.unique(data, return_counts=True)
+        return dict(zip(unique, counts / len(data)))
+    
+    # Technique 1: Chi-Square Test
+    def chi_square_test(self, current_data):
+        """
+        Test if category frequencies changed significantly
+        Good for: detecting new fraud patterns (new merchant types)
+        """
+        current_dist = self._get_distribution(current_data)
+        
+        # Align categories
+        all_categories = set(self.baseline_dist.keys()) | set(current_dist.keys())
+        
+        # Build contingency table
+        baseline_counts = [
+            int(self.baseline_dist.get(cat, 0) * len(self.baseline))
+            for cat in all_categories
+        ]
+        current_counts = [
+            int(current_dist.get(cat, 0) * len(current_data))
+            for cat in all_categories
+        ]
+        
+        # Chi-square test
+        chi2, p_value, dof, expected = chi2_contingency([baseline_counts, current_counts])
+        
+        return {
+            'chi_square_statistic': chi2,
+            'p_value': p_value,
+            'drifted': p_value < 0.05,
+            'new_categories': set(current_dist.keys()) - set(self.baseline_dist.keys())
+        }
+    
+    # Technique 2: Category Proportions
+    def proportion_drift(self, current_data, threshold=0.1):
+        """
+        Monitor if category proportions changed
+        Simple but effective for categorical data
+        """
+        current_dist = self._get_distribution(current_data)
+        
+        drift_detected = False
+        changes = {}
+        
+        for category in self.baseline_dist:
+            baseline_prop = self.baseline_dist[category]
+            current_prop = current_dist.get(category, 0)
+            
+            abs_change = abs(current_prop - baseline_prop)
+            changes[category] = {
+                'baseline': baseline_prop,
+                'current': current_prop,
+                'abs_change': abs_change
+            }
+            
+            if abs_change > threshold:
+                drift_detected = True
+                print(f"Category '{category}': {baseline_prop:.2%} → {current_prop:.2%}")
+        
+        return {
+            'changes': changes,
+            'drifted': drift_detected,
+            'new_categories': set(current_dist.keys()) - set(self.baseline_dist.keys())
+        }
+    
+    # Technique 3: Category Importance (for ML)
+    def category_importance_drift(self, feature_importances_baseline, feature_importances_current):
+        """
+        In fraud detection: if merchant importance increased,
+        it means model relies more on that feature (distribution shift)
+        """
+        importance_change = abs(
+            feature_importances_current - feature_importances_baseline
+        )
+        
+        return {
+            'importance_change': importance_change,
+            'drifted': importance_change > 0.05  # 5% change in importance
+        }
+
+# Example usage
+baseline_merchants = np.array(['Amazon', 'Walmart', 'PayPal', 'Amazon', 'Walmart', 'Amazon'])
+current_merchants = np.array(['Unknown', 'Unknown', 'Crypto', 'Unknown', 'Crypto', 'Unknown'])
+
+detector = CategoricalDriftDetector(baseline_merchants)
+
+print("Chi-Square Test:")
+print(detector.chi_square_test(current_merchants))
+
+print("\nProportion Drift:")
+print(detector.proportion_drift(current_merchants, threshold=0.2))
+```
+
+---
+
+#### Techniques for Embedding Features
+
+For embeddings (vectors from deep learning models), use geometric properties:
+
+```python
+from sklearn.decomposition import PCA
+from sklearn.metrics.pairwise import cosine_distances, euclidean_distances
+
+class EmbeddingDriftDetector:
+    def __init__(self, baseline_embeddings):
+        """
+        baseline_embeddings: (n_samples, embedding_dim)
+        """
+        self.baseline = baseline_embeddings
+        self.baseline_mean = baseline_embeddings.mean(axis=0)
+        self.baseline_cov = np.cov(baseline_embeddings.T)
+    
+    # Technique 1: Centroid Distance
+    def centroid_drift(self, current_embeddings):
+        """
+        How far did the embedding centroid move?
+        Large movement = significant distribution shift
+        """
+        current_mean = current_embeddings.mean(axis=0)
+        
+        # Euclidean distance between centroids
+        distance = np.linalg.norm(current_mean - self.baseline_mean)
+        
+        # Cosine similarity (better for high-dim embeddings)
+        cosine_sim = (
+            np.dot(self.baseline_mean, current_mean) /
+            (np.linalg.norm(self.baseline_mean) * np.linalg.norm(current_mean))
+        )
+        
+        return {
+            'centroid_distance': distance,
+            'cosine_similarity': cosine_sim,  # 1.0 = same, 0.0 = different
+            'drifted': cosine_sim < 0.95  # Alert if similarity drops below 0.95
+        }
+    
+    # Technique 2: Distribution Spread (Variance)
+    def variance_drift(self, current_embeddings):
+        """
+        Did embeddings become more/less spread out?
+        Indicates distribution shape changed
+        """
+        baseline_std = self.baseline.std(axis=0).mean()
+        current_std = current_embeddings.std(axis=0).mean()
+        
+        std_ratio = current_std / (baseline_std + 1e-6)
+        
+        return {
+            'baseline_avg_std': baseline_std,
+            'current_avg_std': current_std,
+            'std_ratio': std_ratio,
+            'drifted': std_ratio > 1.2 or std_ratio < 0.8  # ±20% change
+        }
+    
+    # Technique 3: Mahalanobis Distance
+    def mahalanobis_drift(self, current_embeddings):
+        """
+        Account for covariance structure.
+        Detects shift in any direction (not just mean)
+        """
+        current_mean = current_embeddings.mean(axis=0)
+        
+        try:
+            inv_cov = np.linalg.inv(self.baseline_cov)
+        except:
+            # Fallback if singular
+            inv_cov = np.linalg.pinv(self.baseline_cov)
+        
+        diff = current_mean - self.baseline_mean
+        mahal_distance = np.sqrt(diff @ inv_cov @ diff.T)
+        
+        return {
+            'mahalanobis_distance': mahal_distance,
+            'drifted': mahal_distance > 3.0  # ~3-sigma threshold
+        }
+    
+    # Technique 4: PCA-based Drift (Reconstruction Error)
+    def pca_drift(self, current_embeddings, n_components=10):
+        """
+        Project embeddings to principal component space.
+        If reconstruction error increases, distribution shifted
+        """
+        # Fit PCA on baseline
+        pca = PCA(n_components=n_components)
+        pca.fit(self.baseline)
+        
+        # Reconstruct
+        baseline_reconstructed = pca.inverse_transform(pca.transform(self.baseline))
+        current_reconstructed = pca.inverse_transform(pca.transform(current_embeddings))
+        
+        # Reconstruction error
+        baseline_error = np.mean(np.linalg.norm(
+            self.baseline - baseline_reconstructed, axis=1
+        ))
+        current_error = np.mean(np.linalg.norm(
+            current_embeddings - current_reconstructed, axis=1
+        ))
+        
+        return {
+            'baseline_reconstruction_error': baseline_error,
+            'current_reconstruction_error': current_error,
+            'error_increase': (current_error - baseline_error) / (baseline_error + 1e-6),
+            'drifted': current_error > baseline_error * 1.5  # 50% worse
+        }
+    
+    # Technique 5: MMD (Maximum Mean Discrepancy)
+    def mmd_drift(self, current_embeddings, bandwidth=1.0):
+        """
+        Kernel-based test: compares distributions using kernel methods.
+        Good for high-dimensional data where other tests fail
+        """
+        def gaussian_kernel(X, Y, bandwidth):
+            """Compute Gaussian kernel between X and Y"""
+            dist = np.sum(X**2, axis=1, keepdims=True) - 2*np.dot(X, Y.T) + np.sum(Y**2, axis=1)
+            return np.exp(-dist / (2 * bandwidth**2))
+        
+        # Compute MMD
+        K_baseline = gaussian_kernel(self.baseline, self.baseline, bandwidth)
+        K_cross = gaussian_kernel(self.baseline, current_embeddings, bandwidth)
+        K_current = gaussian_kernel(current_embeddings, current_embeddings, bandwidth)
+        
+        n = self.baseline.shape[0]
+        m = current_embeddings.shape[0]
+        
+        # MMD² = (1/n²)K_baseline + (1/m²)K_current - (2/nm)K_cross
+        mmd_sq = (K_baseline.sum() / (n**2) + K_current.sum() / (m**2) - 
+                  2 * K_cross.sum() / (n*m))
+        
+        mmd = np.sqrt(max(mmd_sq, 0))
+        
+        return {
+            'mmd_distance': mmd,
+            'drifted': mmd > 0.1  # Threshold depends on domain
+        }
+
+# Example usage
+baseline_embeddings = np.random.randn(100, 64)  # 100 samples, 64-dim embeddings
+current_embeddings = np.random.randn(100, 64) + 0.5  # Shifted distribution
+
+detector = EmbeddingDriftDetector(baseline_embeddings)
+
+print("Centroid Drift:")
+print(detector.centroid_drift(current_embeddings))
+
+print("\nVariance Drift:")
+print(detector.variance_drift(current_embeddings))
+
+print("\nMahalanobis Distance:")
+print(detector.mahalanobis_drift(current_embeddings))
+
+print("\nPCA Drift:")
+print(detector.pca_drift(current_embeddings))
+
+print("\nMMD Drift:")
+print(detector.mmd_drift(current_embeddings))
+```
+
+---
+
+#### Unified Drift Detection Pipeline
+
+```python
+class DriftDetectionPipeline:
+    def __init__(self, baseline_X, feature_types):
+        """
+        feature_types: dict mapping column names to 'numeric', 'categorical', 'embedding'
+        """
+        self.baseline_X = baseline_X
+        self.feature_types = feature_types
+        self.detectors = {}
+        
+        # Initialize detectors for each feature
+        for col, ftype in feature_types.items():
+            if ftype == 'numeric':
+                self.detectors[col] = NumericDriftDetector(baseline_X[col])
+            elif ftype == 'categorical':
+                self.detectors[col] = CategoricalDriftDetector(baseline_X[col])
+            elif ftype == 'embedding':
+                self.detectors[col] = EmbeddingDriftDetector(baseline_X[col])
+    
+    def detect_drift(self, current_X, alert_on_any=True):
+        """
+        Check all features for drift
+        
+        alert_on_any: if True, alert if ANY feature drifts
+                      if False, only alert if many features drift
+        """
+        results = {}
+        drift_count = 0
+        
+        for col in self.feature_types:
+            detector = self.detectors[col]
+            ftype = self.feature_types[col]
+            
+            if ftype == 'numeric':
+                # Use multiple tests, trigger if 2+ tests agree
+                ks_result = detector.ks_test(current_X[col])
+                ws_result = detector.wasserstein_distance(current_X[col])
+                
+                drift = ks_result['drifted'] and ws_result['wasserstein_distance'] > 5
+                
+            elif ftype == 'categorical':
+                chi_result = detector.chi_square_test(current_X[col])
+                drift = chi_result['drifted'] or len(chi_result['new_categories']) > 0
+                
+            elif ftype == 'embedding':
+                centroid_result = detector.centroid_drift(current_X[col])
+                mmd_result = detector.mmd_drift(current_X[col])
+                
+                drift = centroid_result['drifted'] and mmd_result['drifted']
+            
+            results[col] = {
+                'type': ftype,
+                'drifted': drift
+            }
+            
+            if drift:
+                drift_count += 1
+        
+        # Aggregate decision
+        if alert_on_any:
+            alert = drift_count > 0
+        else:
+            alert = drift_count > len(self.feature_types) * 0.3  # >30% features drift
+        
+        return {
+            'alert': alert,
+            'drift_count': drift_count,
+            'total_features': len(self.feature_types),
+            'per_feature': results
+        }
+```
+
+---
+
+#### Summary: Which Technique to Use?
+
+```
+NUMERIC FEATURES:
+  Fast check:        Monitor percentiles (P25, P50, P75, P95)
+  Statistical rigor: Kolmogorov-Smirnov test (p < 0.05)
+  Interpretable:     Wasserstein distance (in data units)
+  Conservative:      Combine KS + Wasserstein (alert if both trigger)
+
+CATEGORICAL FEATURES:
+  Fast check:        Track category proportions (alert if any >10% change)
+  Statistical rigor: Chi-square test (p < 0.05)
+  Red flag:          New categories appearing
+  Combined:          Chi-square + count >3 categories with >20% change
+
+EMBEDDING FEATURES:
+  First check:       Centroid drift (cosine similarity < 0.95)
+  Full check:        MMD distance > 0.1
+  Include also:      Variance drift (spread changed by >20%)
+  Conservative:      Require centroid + MMD + variance all trigger
+
+OVERALL PIPELINE:
+  Alert if:          >30% of features drift on multiple independent tests
+  This avoids false positives from single noisy feature
+```
+
+---
+
+
 
 **Q: What are best practices for model retraining?**
 
