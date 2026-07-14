@@ -20,12 +20,160 @@ This is a **living FAQ** for [design.md](design.md) / [solution.md](solution.md)
 | 2 | 2026-07-13 | What's the difference between video embeddings and image embeddings, and how exactly is a video embedding calculated? | `[ANSWERED]` | Terminology / Architecture | [solution.md](solution.md) Step 4A |
 | 3 | 2026-07-13 | How exactly does the re-ranking cross-attention model work? What is cross-attention? | `[ANSWERED]` | Architecture / Math | [solution.md](solution.md) Step 4B |
 | 4 | 2026-07-13 | What is a ViT (Vision Transformer) encoder vs. a CNN encoder? How do they differ and which should I use? | `[ANSWERED]` | Terminology / Architecture | [solution.md](solution.md) Step 4A |
+| 5 | 2026-07-13 | What are "perception stack detections"? What information do they contain, and what do some concrete examples look like? | `[ANSWERED]` | Terminology | [solution.md](solution.md) Step 4A |
 
 *(Append new rows as questions come in.)*
 
 ---
 
 ## Terminology
+
+### Q: What are "perception stack detections"? What information do they contain, and what do some concrete examples look like? `[ANSWERED]`
+
+**A:**
+
+The **perception stack** is the AV's real-time object-detection and tracking system — it runs continuously on raw sensor input (camera, LiDAR, radar) and outputs what it detected: where agents (pedestrians, cyclists, vehicles, etc.) are, what they are, and some metadata about each detection.
+
+**What a single "detection" contains** — typically a structured record with:
+
+```python
+detection = {
+    'timestamp': 1234567890.123,           # when was this detected
+    'agent_id': 'track_42',                # persistent ID for this agent across frames
+    'agent_class': 'pedestrian',           # what is it (pedestrian, cyclist, car, truck, etc.)
+    'bbox_3d': {                           # 3D bounding box in world coordinates
+        'center': [x, y, z],               # center position (meters, relative to vehicle)
+        'size': [length, width, height],   # physical dimensions
+        'orientation': yaw_angle           # heading/facing direction
+    },
+    'confidence': 0.87,                    # how sure is the model (0.0 to 1.0)
+    'velocity': [vx, vy, vz],              # estimated velocity (m/s)
+    'attributes': {
+        'occluded': False,                 # partially hidden from view?
+        'truncated': False,                # cut off at image edge?
+        'num_frames_tracked': 12,          # how many frames has this ID existed?
+    }
+}
+```
+
+**Why "stack"?** The full pipeline is a stack of stages (sensor fusion, 2D detection, tracking, classification) that all output intermediate results. When we say "perception-stack detections," we're referring to the final, consolidated detection list that comes out of the tracker (so a single agent is represented as one track, not multiple detections per frame).
+
+**Concrete examples from driving scenarios:**
+
+**Example 1: Pedestrian at a crosswalk**
+```python
+{
+    'timestamp': 1234567890.500,
+    'agent_id': 'ped_18',
+    'agent_class': 'pedestrian',
+    'bbox_3d': {
+        'center': [15.2, -2.1, 0.0],      # 15m ahead, 2m to the left, ground level
+        'size': [0.5, 0.4, 1.7],          # person-sized
+        'orientation': 1.57                # facing perpendicular to vehicle direction
+    },
+    'confidence': 0.92,
+    'velocity': [0.3, -0.8, 0.0],         # moving left and slightly toward vehicle
+    'attributes': {
+        'occluded': False,
+        'truncated': False,
+        'num_frames_tracked': 45,          # been visible for 45 frames = ~1.5 seconds at 30fps
+    }
+}
+```
+
+**Example 2: Partially-occluded cyclist**
+```python
+{
+    'timestamp': 1234567890.500,
+    'agent_id': 'cyclist_7',
+    'agent_class': 'cyclist',             # rider + bike detected together
+    'bbox_3d': {
+        'center': [22.5, 3.2, 0.0],       # 22.5m ahead, 3.2m to the right
+        'size': [2.1, 0.6, 1.5],          # bike is longer and narrower than a person
+        'orientation': 0.05                # heading mostly straight (parallel to vehicle)
+    },
+    'confidence': 0.73,                   # lower confidence because partially blocked
+    'velocity': [3.2, 0.1, 0.0],          # moving forward at ~3.2 m/s (reasonable bike speed)
+    'attributes': {
+        'occluded': True,                 # partially hidden (e.g., by a parked car)
+        'truncated': False,
+        'num_frames_tracked': 8,          # just appeared recently
+    }
+}
+```
+
+**Example 3: Vehicle merging into lane**
+```python
+{
+    'timestamp': 1234567890.500,
+    'agent_id': 'car_102',
+    'agent_class': 'car',
+    'bbox_3d': {
+        'center': [18.7, 4.5, 0.0],       # 18.7m ahead, 4.5m to the right (adjacent lane)
+        'size': [4.7, 1.8, 1.5],          # standard car dimensions
+        'orientation': -0.12               # angled slightly toward our vehicle (turning in)
+    },
+    'confidence': 0.96,                   # high confidence, large vehicle, clear
+    'velocity': [4.2, -0.9, 0.0],         # moving forward at 4.2 m/s, steering left (-0.9 m/s leftward)
+    'attributes': {
+        'occluded': False,
+        'truncated': False,
+        'num_frames_tracked': 120,        # been visible for several seconds
+    }
+}
+```
+
+**Example 4: Truck partially off-road**
+```python
+{
+    'timestamp': 1234567890.500,
+    'agent_id': 'truck_5',
+    'agent_class': 'truck',               # explicitly classified as truck, not generic car
+    'bbox_3d': {
+        'center': [35.1, -1.8, 0.0],      # 35m ahead, slightly to the left, parked
+        'size': [8.5, 2.5, 2.8],          # much larger than a car
+        'orientation': 0.0                 # aligned with road
+    },
+    'confidence': 0.98,                   # very clear, large, unoccluded
+    'velocity': [0.0, 0.0, 0.0],          # stationary (parked)
+    'attributes': {
+        'occluded': False,
+        'truncated': True,                # extends beyond the sensor's field of view at this range
+        'num_frames_tracked': 300+,       # stationary object, been there many frames
+    }
+}
+```
+
+**How these are used for caption generation (Step 4A).**
+
+The system doesn't store hand-written captions for every clip — instead, it **auto-generates templates** from these perception detections. For example, given the detections above at a particular timestamp, you might generate:
+
+```
+"Pedestrian in crosswalk on the left, ~15m ahead, facing perpendicular to vehicle direction"
+  ↓ (from pedestrian track_18)
+
+"Cyclist partially occluded by parked car on the right, ~22m ahead, moving forward"
+  ↓ (from cyclist track_7)
+
+"Car merging into lane from right, ~18m ahead, traveling at 4.2 m/s"
+  ↓ (from car track_102)
+
+"Large truck parked on the left shoulder ahead"
+  ↓ (from truck track_5)
+
+Combined, multi-agent caption:
+"Pedestrian in crosswalk on left, partially-occluded cyclist on right, and car merging in from right lane; truck parked on shoulder ahead"
+```
+
+These auto-generated captions are **weak labels** (they can be noisy or miss nuance) but are **abundant and cost-free** to generate — you get one or more per scene. This lets you bootstrap millions of (video clip, caption) pairs to train the CLIP-style embedding with, which you then refine with a smaller set of **human-written captions** on interesting/rare scenarios (the long-tail cases from [driving_scene_search](design.md)).
+
+**Why confidence matters:** detections with low confidence (e.g., `confidence=0.65`) are often filtered out at the planning stage (the planner won't commit a safety-critical decision based on a low-confidence detection), so they're often de-weighted or ignored in caption generation. High-confidence detections (> 0.85) are treated as reliable and heavily weighted in the caption.
+
+**Why tracking matters:** the `agent_id` and `num_frames_tracked` let you reason about **temporal stability** — a detection that just appeared (`num_frames_tracked=1`) is less reliable than one that's been consistently tracked for many frames, because the tracker filters out noise and confirms agent identity over time.
+
+*Pointer:* [solution.md](solution.md), Step 4A "Multimodal Video/Text Embeddings" — "Where does training data (video, text) come from?"
+
+---
 
 ### Q: What is a ViT (Vision Transformer) encoder vs. a CNN encoder? How do they differ, and which should I use for video encoding? `[ANSWERED]`
 
