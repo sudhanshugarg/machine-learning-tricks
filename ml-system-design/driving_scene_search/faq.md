@@ -25,6 +25,7 @@ This is a **living FAQ** for [design.md](design.md) / [solution.md](solution.md)
 | 7 | 2026-07-13 | What exactly are "image tokens" or "video tokens"? I understand text tokens, but image/video tokens are confusing — aren't images just RGB pixels? | `[ANSWERED]` | Terminology | [solution.md](solution.md) Step 4A |
 | 8 | 2026-07-13 | In Step 4C long-tail mining, the seed-based approach assumes you know what to look for. What about automatically finding rare scenarios via clustering or other unsupervised methods? | `[ANSWERED]` | Architecture | [solution.md](solution.md) Step 4C |
 | 9 | 2026-07-13 | What is a BEV map? The solution mentions using LiDAR as a BEV representation, but what does that actually look like? | `[ANSWERED]` | Terminology | [solution.md](solution.md) Step 4A |
+| 10 | 2026-07-13 | How exactly do you do embedding-space anomaly detection? What is the algorithm? | `[ANSWERED]` | Math / Architecture | [solution.md](solution.md) Step 4C |
 
 *(Append new rows as questions come in.)*
 
@@ -1128,3 +1129,343 @@ This multi-method approach ensures you catch rare scenarios across multiple sign
 *Pointer:* [solution.md](solution.md), Step 4C "Long-Tail Data Sampling for Training Sets" — sections 1–6 (especially section 6 on discovering unknown scenarios).
 
 ---
+
+### Q: How exactly do you do embedding-space anomaly detection? What is the algorithm? `[ANSWERED]`
+
+**A:**
+
+Embedding-space anomaly detection finds videos whose embeddings are **outliers** — far from the typical/normal distribution of embeddings in the archive. Here are the main algorithmic approaches, from simplest to most sophisticated:
+
+### 1. **Statistical Thresholding (Simplest baseline)**
+
+Treat the embedding distribution as a single high-dimensional cloud, and flag points more than $k$ standard deviations from the mean:
+
+```python
+embeddings = load_all_embeddings()  # shape: (N_videos, 512)
+
+# Compute mean and std per dimension
+mean_embedding = embeddings.mean(axis=0)  # shape: (512,)
+std_embedding = embeddings.std(axis=0)    # shape: (512,)
+
+# Standardize each embedding
+z_scores = (embeddings - mean_embedding) / std_embedding  # shape: (N_videos, 512)
+
+# Compute L2 norm of z-scores (distance from center in std units)
+distances = np.linalg.norm(z_scores, axis=1)  # shape: (N_videos,)
+
+# Flag outliers: > k standard deviations away
+k = 3  # tune based on desired sensitivity
+anomalies = np.where(distances > k)[0]
+
+print(f"Found {len(anomalies)} anomalies out of {len(embeddings)} videos")
+```
+
+**Pros:**
+- Dead simple, no training required.
+- Assumes embeddings are roughly normally distributed (often true after centering/normalizing).
+
+**Cons:**
+- Doesn't account for the **shape** of the distribution (some dimensions might have higher variance than others).
+- Breaks down in high dimensions (curse of dimensionality — in high-D space, all points are far apart).
+
+---
+
+### 2. **Mahalanobis Distance / Robust Covariance (Better for correlated dimensions)**
+
+Instead of per-dimension z-scores, fit a multivariate Gaussian to the data and use **Mahalanobis distance** — which accounts for the full covariance structure:
+
+$$d_{\text{Mahal}}(x) = \sqrt{(x - \mu)^\top \Sigma^{-1} (x - \mu)}$$
+
+where $\mu$ is the mean and $\Sigma$ is the covariance matrix.
+
+```python
+from sklearn.covariance import EllipticEnvelope
+import numpy as np
+
+embeddings = load_all_embeddings()  # shape: (N_videos, 512)
+
+# Fit a robust covariance estimator (handles outliers better than standard MLE)
+robust_cov = EllipticEnvelope(
+    contamination=0.05,  # assume ~5% of data are outliers
+    random_state=42
+)
+robust_cov.fit(embeddings)
+
+# Get Mahalanobis distances
+distances = robust_cov.mahalanobis(embeddings)  # shape: (N_videos,)
+
+# Get binary outlier predictions
+outlier_predictions = robust_cov.predict(embeddings)  # -1 = outlier, +1 = inlier
+
+# Or manually threshold by distance
+threshold = np.percentile(distances, 95)  # top 5% as anomalies
+anomalies = np.where(distances > threshold)[0]
+
+print(f"Found {len(anomalies)} anomalies (top 5% by Mahalanobis distance)")
+```
+
+**How it works:**
+1. Compute the empirical mean $\mu$ and covariance $\Sigma$ of embeddings.
+2. For each embedding $x$, compute the Mahalanobis distance from the center.
+3. High distance = far from the center, in a direction that's "surprising" given the covariance structure.
+
+**Pros:**
+- Accounts for correlation between embedding dimensions.
+- `EllipticEnvelope` uses a **robust** covariance estimator (minimum covariance determinant) that resists outliers.
+- More principled than z-scores in high dimensions.
+
+**Cons:**
+- Assumes a single Gaussian blob (what if there are multiple clusters of "normal" scenarios?).
+- Computationally expensive ($O(n^3)$ for covariance inversion).
+
+---
+
+### 3. **Isolation Forest (Fast, scalable, non-parametric)**
+
+Isolation Forest builds random decision trees that isolate anomalies by repeatedly splitting the data. Anomalies are "easier to isolate" (require fewer splits) than normal points.
+
+```python
+from sklearn.ensemble import IsolationForest
+
+embeddings = load_all_embeddings()  # shape: (N_videos, 512)
+
+# Train isolation forest
+iso_forest = IsolationForest(
+    contamination=0.05,      # expect ~5% anomalies
+    n_estimators=100,        # number of trees
+    random_state=42
+)
+iso_forest.fit(embeddings)
+
+# Get anomaly predictions
+outlier_predictions = iso_forest.predict(embeddings)  # -1 = outlier, +1 = inlier
+
+# Get anomaly scores (more negative = more anomalous)
+anomaly_scores = iso_forest.score_samples(embeddings)
+anomalies = np.where(outlier_predictions == -1)[0]
+
+# Or threshold by score percentile
+threshold_score = np.percentile(anomaly_scores, 5)  # bottom 5%
+anomalies = np.where(anomaly_scores < threshold_score)[0]
+
+print(f"Found {len(anomalies)} anomalies via Isolation Forest")
+```
+
+**How it works:**
+1. Build a forest of random decision trees.
+2. At each node, randomly pick a dimension and split value.
+3. Anomalies get isolated quickly (low depth), normal points take many splits (high depth).
+4. Anomaly score = average depth across all trees (lower depth → higher anomaly score).
+
+**Pros:**
+- **Non-parametric** — no assumption about the shape of the normal distribution.
+- **Fast** — $O(n \log n)$ training and $O(\log n)$ per-sample scoring.
+- **Scalable** — works well on high-dimensional data.
+- **Handles multiple clusters naturally** — doesn't assume a single Gaussian.
+
+**Cons:**
+- Less interpretable than distance-based methods (hard to explain *why* something is an anomaly).
+- Hyperparameter tuning needed (contamination estimate, number of trees).
+
+---
+
+### 4. **Local Outlier Factor (LOF) — Density-based**
+
+Instead of global distance from center, LOF compares each point's **local density** to its neighbors' local densities. Points in sparse regions are flagged as anomalies.
+
+```python
+from sklearn.neighbors import LocalOutlierFactor
+
+embeddings = load_all_embeddings()  # shape: (N_videos, 512)
+
+# Fit LOF
+lof = LocalOutlierFactor(
+    n_neighbors=20,          # k-nearest neighbors to consider
+    contamination=0.05       # expect ~5% anomalies
+)
+lof.fit(embeddings)
+
+# Get outlier predictions
+outlier_predictions = lof.predict(embeddings)  # -1 = outlier, +1 = inlier
+
+# Get LOF scores (> 1.0 = anomalous, ≈ 1.0 = normal)
+lof_scores = lof.negative_outlier_factor_  # lower = more anomalous
+anomalies = np.where(outlier_predictions == -1)[0]
+
+print(f"Found {len(anomalies)} anomalies via LOF")
+```
+
+**How it works:**
+1. For each point, compute the density of its k-nearest neighbors (reachability distance).
+2. Compare the point's own local density to its neighbors' densities.
+3. If a point has much **lower** local density than neighbors, it's anomalous.
+
+**Pros:**
+- Detects clusters naturally — a point in a sparse region is anomalous, even if close to the global center.
+- Handles multiple clusters without explicitly modeling them.
+
+**Cons:**
+- Computationally expensive: $O(n^2)$ (need k-NN for every point).
+- The `contamination` parameter is harder to set.
+
+---
+
+### 5. **Gaussian Mixture Model (GMM) — Probabilistic clustering**
+
+Fit a mixture of Gaussians to the data, then find points with low **log-likelihood** under the model:
+
+```python
+from sklearn.mixture import GaussianMixture
+
+embeddings = load_all_embeddings()  # shape: (N_videos, 512)
+
+# Fit a mixture of K Gaussians to the data
+K = 50  # number of clusters (tune via BIC or cross-validation)
+gmm = GaussianMixture(n_components=K, random_state=42)
+gmm.fit(embeddings)
+
+# Get log-likelihood for each point
+log_likelihood = gmm.score_samples(embeddings)  # shape: (N_videos,)
+
+# Low likelihood = anomalous
+threshold = np.percentile(log_likelihood, 5)  # bottom 5% by likelihood
+anomalies = np.where(log_likelihood < threshold)[0]
+
+print(f"Found {len(anomalies)} anomalies via GMM (low likelihood)")
+```
+
+**How it works:**
+1. Fit a mixture of $K$ Gaussians to the embedding distribution.
+2. For each point, compute $p(x) = \sum_k \pi_k \mathcal{N}(x | \mu_k, \Sigma_k)$ (marginal likelihood).
+3. Points with low probability under the model are anomalies.
+
+**Pros:**
+- Naturally handles multiple clusters.
+- Probabilistic: you get actual likelihoods, not just binary labels.
+- Can tune K via information criteria (BIC, AIC).
+
+**Cons:**
+- Computationally expensive.
+- Choosing K is non-obvious.
+- Assumes Gaussian clusters.
+
+---
+
+### 6. **One-Class SVM (Support Vector Data Description)**
+
+Train an SVM that learns a boundary around "normal" data, flagging points outside as anomalies.
+
+```python
+from sklearn.svm import OneClassSVM
+
+embeddings = load_all_embeddings()  # shape: (N_videos, 512)
+
+# Train one-class SVM
+svm = OneClassSVM(
+    kernel='rbf',           # radial basis function kernel
+    gamma='auto',           # kernel bandwidth
+    nu=0.05                 # fraction of points to flag as outliers (~5%)
+)
+svm.fit(embeddings)
+
+# Get predictions
+outlier_predictions = svm.predict(embeddings)  # -1 = outlier, +1 = inlier
+
+# Get decision function scores (more negative = more anomalous)
+scores = svm.decision_function(embeddings)
+anomalies = np.where(outlier_predictions == -1)[0]
+
+print(f"Found {len(anomalies)} anomalies via One-Class SVM")
+```
+
+**Pros:**
+- Very flexible (non-linear boundary via kernel trick).
+- Theoretically grounded (margin maximization).
+
+**Cons:**
+- Computationally expensive ($O(n^3)$ in naive form).
+- Hyperparameter tuning (kernel choice, gamma, nu) is fiddly.
+
+---
+
+### **Comparison table:**
+
+| Algorithm | Complexity | Scalability | Assumptions | Best for |
+|---|---|---|---|---|
+| Z-score | $O(n)$ | Excellent | Single Gaussian | Baseline |
+| Mahalanobis | $O(n^3)$ | Poor | Single Gaussian + covariance | Correlated dims |
+| **Isolation Forest** | $O(n \log n)$ | **Excellent** | **None** | **Large-scale production** |
+| LOF | $O(n^2)$ | Moderate | Density-based | Multiple clusters |
+| GMM | $O(nKd^3)$ | Moderate | Multiple Gaussians | Explicit clustering |
+| One-Class SVM | $O(n^3)$ | Poor | Non-linear boundary | Complex boundaries |
+
+---
+
+### **For the driving-scene system: Recommended approach**
+
+For **billions of videos**, use a **tiered strategy**:
+
+```python
+# Tier 1: Fast initial screening (Isolation Forest on full archive)
+iso_forest = IsolationForest(contamination=0.05, n_estimators=100)
+iso_forest.fit(embeddings)
+initial_anomalies = iso_forest.predict(embeddings) == -1
+
+# Tier 2: High-precision refinement (Mahalanobis on a sample)
+# For efficiency, only refit on a representative sample
+sample_idxs = np.random.choice(len(embeddings), 100_000, replace=False)
+robust_cov = EllipticEnvelope(contamination=0.05)
+robust_cov.fit(embeddings[sample_idxs])
+mahal_distances = robust_cov.mahalanobis(embeddings)
+
+# Combine: flag as anomaly if both agree
+refined_anomalies = initial_anomalies & (
+    mahal_distances > np.percentile(mahal_distances, 95)
+)
+
+# Tier 3: Context filtering (manual heuristics)
+# Remove "anomalies" that are actually hard-but-valid scenarios
+# (e.g., rare weather the system still handled OK)
+final_anomalies = context_filter(
+    refined_anomalies, 
+    perception_logs, 
+    planning_logs
+)
+
+print(f"Flagged {final_anomalies.sum()} anomalies for human review")
+```
+
+**Why this multi-tier approach:**
+1. **Isolation Forest** catches most anomalies fast (linear in n).
+2. **Mahalanobis** refines on the initial set (removes false positives).
+3. **Context filtering** removes valid hard scenarios, focusing on true failures.
+
+---
+
+### **Practical considerations:**
+
+**1. Normalize embeddings:**
+```python
+# L2 normalization (if embeddings are cosine-similarity-based)
+embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+```
+
+**2. Handle scale:** For billions of embeddings:
+- Use streaming/mini-batch versions of algorithms.
+- Subsample for initial fitting, then score all data.
+- Use approximate k-NN (HNSW) for LOF instead of exact k-NN.
+
+**3. Tune `contamination`:**
+- Start with 5–10% based on expected long-tail frequency.
+- Validate on a labeled held-out set (compute precision/recall).
+- Use model selection (maximize silhouette score on normal points).
+
+**4. Handle concept drift:**
+- Re-fit the detector periodically (weekly/monthly) as the archive grows.
+- Track top anomaly scores over time — if they're dropping, the model may be miscalibrated.
+
+*Pointer:* [[Long-tail mining alternatives question above]] for how anomaly detection fits into the broader mining pipeline; [solution.md](solution.md) Step 4C.
+
+---
+
+## Tradeoffs
