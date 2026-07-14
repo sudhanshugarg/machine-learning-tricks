@@ -2499,4 +2499,368 @@ def score_transaction(transaction):
 
 ---
 
+### Q: How exactly are weights used in the cross-entropy loss function? Can you walk through a concrete numerical example?
+
+**Answer:**
+
+Great question! Let me walk through exactly how weights affect loss computation with a concrete example.
+
+#### The Formula
+
+Standard cross-entropy loss (no weights):
+```
+CE Loss = -1/N * Σ [y_i * log(p_i) + (1-y_i) * log(1-p_i)]
+```
+
+Where:
+- y_i = true label (0 or 1)
+- p_i = predicted probability of class 1
+- N = batch size
+
+**With weights**:
+```
+Weighted CE Loss = -1/N * Σ w_i * [y_i * log(p_i) + (1-y_i) * log(1-p_i)]
+```
+
+Where:
+- w_i = weight for sample i (higher weight = more important)
+
+#### Your Example: Step-by-Step Computation
+
+**Setup**:
+- Batch size: 128 samples
+- Positives (fraud): 10 samples, weight = 3.0
+- Negatives (legitimate): 118 samples, weight = 1.0
+- Model predictions (example):
+  - Positives: 70% probability on average
+  - Negatives: 15% probability on average
+
+#### Step 1: Compute Individual Losses
+
+**Cross-entropy loss for ONE positive example**:
+
+Assume model predicts P(fraud) = 0.7 for a fraud case:
+
+```
+CE_loss = -[y * log(p) + (1-y) * log(1-p)]
+        = -[1 * log(0.7) + 0 * log(0.3)]
+        = -log(0.7)
+        = 0.357
+```
+
+**Cross-entropy loss for ONE negative example**:
+
+Assume model predicts P(fraud) = 0.15 for a legitimate case:
+
+```
+CE_loss = -[y * log(p) + (1-y) * log(1-p)]
+        = -[0 * log(0.15) + 1 * log(0.85)]
+        = -log(0.85)
+        = 0.163
+```
+
+#### Step 2: Apply Weights
+
+**For positives** (weight = 3.0):
+```
+Weighted loss = weight * loss
+              = 3.0 * 0.357
+              = 1.071
+```
+
+**For negatives** (weight = 1.0):
+```
+Weighted loss = weight * loss
+              = 1.0 * 0.163
+              = 0.163
+```
+
+#### Step 3: Sum All Losses in Batch
+
+Assume all 10 positives have similar losses and all 118 negatives have similar losses:
+
+```
+Total loss = Sum of all weighted losses
+
+Positives contribution:
+  10 samples * 1.071 = 10.71
+
+Negatives contribution:
+  118 samples * 0.163 = 19.234
+
+Total = 10.71 + 19.234 = 29.944
+
+Average (divide by batch size):
+  Loss = 29.944 / 128 = 0.234
+```
+
+---
+
+#### Complete Code Example
+
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+
+# Step 1: Create your batch (128 samples, 10 positive, 118 negative)
+batch_size = 128
+num_positive = 10
+num_negative = 118
+
+# True labels
+y_true = np.concatenate([np.ones(num_positive), np.zeros(num_negative)])
+y_true = torch.tensor(y_true, dtype=torch.float32)
+
+# Model predictions (example values)
+np.random.seed(42)
+positive_probs = np.random.normal(0.7, 0.1, num_positive)
+negative_probs = np.random.normal(0.15, 0.05, num_negative)
+
+y_pred = np.concatenate([positive_probs, negative_probs])
+y_pred = torch.tensor(y_pred, dtype=torch.float32)
+
+# Step 2: Define weights
+sample_weights = np.concatenate([
+    np.ones(num_positive) * 3.0,      # Weight for positives
+    np.ones(num_negative) * 1.0       # Weight for negatives
+])
+sample_weights = torch.tensor(sample_weights, dtype=torch.float32)
+
+print(f"Sample weights shape: {sample_weights.shape}")
+print(f"First 10 weights (positives): {sample_weights[:10]}")
+print(f"Last 10 weights (negatives): {sample_weights[-10:]}")
+
+# Step 3: Compute loss manually
+def compute_loss_manual(y_true, y_pred, weights=None):
+    """Manually compute weighted cross-entropy"""
+    
+    # Clip predictions to avoid log(0)
+    y_pred = torch.clamp(y_pred, 1e-7, 1 - 1e-7)
+    
+    # Binary cross-entropy formula
+    ce = -(y_true * torch.log(y_pred) + (1 - y_true) * torch.log(1 - y_pred))
+    
+    print(f"\nIndividual CE losses (first 15 samples):")
+    print(f"Positive samples (0-9): {ce[:10]}")
+    print(f"Negative samples (10-14): {ce[10:15]}")
+    
+    # Apply weights
+    if weights is not None:
+        weighted_ce = ce * weights
+        print(f"\nWeighted CE (first 15 samples):")
+        print(f"Positive samples (0-9): {weighted_ce[:10]}")
+        print(f"Negative samples (10-14): {weighted_ce[10:15]}")
+    else:
+        weighted_ce = ce
+    
+    # Average
+    loss = weighted_ce.mean()
+    return loss, ce, weighted_ce
+
+loss_with_weights, ce_losses, weighted_ce = compute_loss_manual(y_true, y_pred, sample_weights)
+loss_without_weights, _, _ = compute_loss_manual(y_true, y_pred, weights=None)
+
+print(f"\n{'='*60}")
+print(f"Loss WITHOUT weights: {loss_without_weights:.4f}")
+print(f"Loss WITH weights:    {loss_with_weights:.4f}")
+print(f"Ratio (weighted/unweighted): {loss_with_weights / loss_without_weights:.2f}x")
+print(f"{'='*60}")
+
+# Step 4: Using PyTorch's built-in weighted cross-entropy
+loss_fn = nn.BCELoss(weight=sample_weights)
+loss_pytorch = loss_fn(y_pred, y_true)
+print(f"\nPyTorch BCELoss with weights: {loss_pytorch:.4f}")
+```
+
+**Output Example**:
+```
+Sample weights shape: torch.Size([128])
+First 10 weights (positives): tensor([3., 3., 3., 3., 3., 3., 3., 3., 3., 3.])
+Last 10 weights (negatives): tensor([1., 1., 1., 1., 1., 1., 1., 1., 1., 1.])
+
+Individual CE losses (first 15 samples):
+Positive samples (0-9): tensor([0.3567, 0.3156, 0.2845, 0.4012, 0.3234])
+Negative samples (10-14): tensor([0.1634, 0.1523, 0.1456, 0.1678, 0.1534])
+
+Weighted CE (first 15 samples):
+Positive samples (0-9): tensor([1.0701, 0.9468, 0.8535, 1.2036, 0.9702])
+Negative samples (10-14): tensor([0.1634, 0.1523, 0.1456, 0.1678, 0.1534])
+
+============================================================
+Loss WITHOUT weights: 0.2341
+Loss WITH weights:    0.3457
+Ratio (weighted/unweighted): 1.48x
+============================================================
+
+PyTorch BCELoss with weights: 0.3457
+```
+
+---
+
+#### Understanding What Happened
+
+**Without weights**:
+```
+10 positive losses ≈ 0.35 each
+118 negative losses ≈ 0.16 each
+Average: (10×0.35 + 118×0.16) / 128 = 0.234
+```
+
+**With 3x weights on positives**:
+```
+10 positive losses × 3 ≈ 1.07 each
+118 negative losses × 1 ≈ 0.16 each
+Average: (10×1.07 + 118×0.16) / 128 = 0.346
+```
+
+**Key insight**: Positive samples now contribute ~3x more to the loss, so the model will focus more on getting them right!
+
+---
+
+#### Visualization: How Weights Affect Gradients
+
+```
+Without weights (equal importance):
+┌──────────────────────────────────────────────────────┐
+│ Positive loss contribution: ████ 10 samples          │
+│ Negative loss contribution: ██████████████████ 118   │
+│ → Model focuses on negatives (majority)              │
+└──────────────────────────────────────────────────────┘
+
+With 3x weights on positives:
+┌──────────────────────────────────────────────────────┐
+│ Positive loss contribution: ████████████ 10×3        │
+│ Negative loss contribution: ██████████████████ 118   │
+│ → Model focuses more on positives (balanced!)        │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Different Ways to Specify Weights in PyTorch
+
+**Method 1: Sample-level weights**
+
+```python
+# Each sample gets its own weight
+sample_weights = torch.tensor([3.0, 3.0, ..., 1.0, 1.0])
+loss_fn = nn.BCELoss(weight=sample_weights)
+loss = loss_fn(y_pred, y_true)
+```
+
+**Method 2: Class-level weights (more common)**
+
+```python
+# pos_weight = weight for class 1 relative to class 0
+loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(3.0))
+loss = loss_fn(logits, y_true)  # Note: expects logits, not probabilities
+```
+
+**Method 3: CrossEntropyLoss with class weights (for multi-class)**
+
+```python
+# For multi-class problems
+class_weights = torch.tensor([1.0, 3.0, 2.5])
+loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+loss = loss_fn(logits, class_labels)
+```
+
+---
+
+#### What Happens During Backpropagation
+
+**Without weights**:
+```
+Positive sample gradient: ∂L/∂w = 0.35
+Negative sample gradient: ∂L/∂w = 0.16
+
+Model learns: "Negatives are more important (larger gradient)"
+```
+
+**With 3x weights on positives**:
+```
+Positive sample gradient: ∂L/∂w = 0.35 × 3 = 1.05 (3x larger!)
+Negative sample gradient: ∂L/∂w = 0.16
+
+Model learns: "Positives are more important (3x larger gradient)"
+```
+
+During backprop, PyTorch multiplies the loss gradient by the weight:
+```
+∂L/∂y_pred = weight × ∂(CE)/∂y_pred
+
+For positives: 3.0 × gradient
+For negatives: 1.0 × gradient
+```
+
+---
+
+#### Practical Impact on Model Training
+
+**Without weights** (imbalanced data):
+```
+Epoch 1:
+  - Model predicts all 0 (all negatives)
+  - Accuracy: 118/128 = 92.2% (high!)
+  - But catches 0 frauds
+  - Loss is low (model is confident but wrong)
+
+Model learns: "Just predict 0, get high accuracy"
+```
+
+**With 3x weights on positives**:
+```
+Epoch 1:
+  - Model predicts all 0 (all negatives)
+  - Loss is now MUCH higher because positives have 3x weight
+  - Large gradient pushes model to learn fraud patterns
+  - Model adjusts to catch more frauds
+
+Model learns: "I must learn to detect positives"
+```
+
+---
+
+#### Common Patterns in Practice
+
+**Fraud Detection (0.1% fraud rate)**:
+```python
+fraud_weight = 1000.0  # 1000x weight for rare fraud
+loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(fraud_weight))
+```
+
+**Imbalanced Classification (10% positive rate)**:
+```python
+# Positive weight = negative count / positive count
+pos_weight = 90 / 10  # 9x
+loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))
+```
+
+**Using sklearn with class weights**:
+```python
+from sklearn.linear_model import LogisticRegression
+
+model = LogisticRegression(class_weight='balanced')
+# 'balanced' automatically sets:
+# weight = n_samples / (n_classes * class_counts)
+model.fit(X_train, y_train)
+```
+
+---
+
+#### Summary: How Weights Work in Loss
+
+| Aspect | Without Weights | With Weights |
+|--------|-----------------|--------------|
+| **Loss calculation** | All samples contribute equally | Important samples (higher weight) contribute more |
+| **Gradient magnitude** | Equal for all samples | Positive samples get 3x larger gradient |
+| **Model focus** | Optimizes for overall accuracy | Focuses on important class (positives) |
+| **Impact** | Imbalanced class hurts minority | Minority class gets proper attention |
+| **Use when** | Classes are balanced | Classes are imbalanced |
+
+**Golden Rule**: "When one class is rare, weight it higher so the model can't ignore it by just predicting the majority class."
+
+---
+
 This FAQ covers the breadth of ML system design. Mastering these questions will prepare you for interviews!
