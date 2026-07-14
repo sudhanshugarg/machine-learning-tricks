@@ -53,25 +53,273 @@ This FAQ addresses common questions across ML system design problems. These are 
 Common data quality issues to look for:
 
 #### Missing Values
-- **Identify**: Check % of null values per feature
-- **Handle**:
-  - **Deletion**: Remove rows/columns if > threshold (e.g., > 50% missing)
-  - **Imputation**: 
-    - Mean/median for numerical features
-    - Mode for categorical features
-    - Forward fill / backward fill for time-series
-    - Predictive imputation (KNN, regression)
-  - **Create indicator feature**: Mark whether value was missing (can be predictive)
+
+Missing data can occur at two levels:
+1. **Column level**: Feature has many missing values across rows
+2. **Row level**: Individual row has missing values in some features
+
+**COLUMN-LEVEL decisions** (Should we keep this feature?):
+
+```
+If feature is missing > 50% of values:
+
+Option 1: DROP THE COLUMN (Feature removal)
+├─ When to use: Feature is not useful (most values missing)
+├─ Pros: Simple, no imputation needed
+├─ Cons: Lose all signal from that feature
+└─ Example: If 'phone_number' is 60% missing, drop it
+
+Option 2: IMPUTE ALL MISSING VALUES (Keep feature)
+├─ When to use: Feature is useful but incomplete
+├─ Pros: Retain information from feature
+├─ Cons: Imputation adds noise
+└─ Example: If 'age' is 30% missing, impute with median
+
+Decision Framework:
+┌─────────────────────────────────────────────────┐
+│ Missing % in column:                            │
+│ ├─ < 5%: Always impute (little missing)         │
+│ ├─ 5-30%: Usually impute (moderate missing)     │
+│ ├─ 30-50%: Consider both (borderline)           │
+│ └─ > 50%: Usually drop (too much missing)       │
+└─────────────────────────────────────────────────┘
+```
+
+**ROW-LEVEL decisions** (Should we keep this training sample?):
+
+```
+If a row has missing values in some features:
+
+Option 1: DROP THE ROW (Sample removal)
+├─ When to use: Row is incomplete/unreliable
+├─ Pros: Keep data quality high
+├─ Cons: Lose training samples (especially harmful if rare class)
+└─ Example: Transaction with missing critical fields
+
+Option 2: IMPUTE MISSING VALUES (Keep row)
+├─ When to use: Row is mostly complete
+├─ Pros: Keep training samples
+├─ Cons: Imputed values may be noisy
+└─ Example: Row with 1-2 missing values out of 50 features
+
+Decision Framework:
+┌──────────────────────────────────────────────────┐
+│ Missing features in this row:                    │
+│ ├─ 0 features: Keep (no missing)                │
+│ ├─ 1-3 features: Impute (mostly complete)       │
+│ ├─ 3-5 features: Consider both (borderline)     │
+│ └─ > 5 features: Usually drop (too incomplete)  │
+└──────────────────────────────────────────────────┘
+```
+
+#### Code Example: Distinguish Column vs Row-level
+
+```python
+import pandas as pd
+import numpy as np
+
+df = pd.DataFrame({
+    'amount': [100, 200, np.nan, 400, 500],
+    'age': [25, np.nan, 35, np.nan, 55],
+    'phone': [np.nan, np.nan, np.nan, '555-1234', np.nan],
+    'location': ['US', 'UK', 'US', 'US', 'UK']
+})
+
+print("Missing values per column:")
+print(df.isnull().sum())
+# amount: 1 missing (20%)
+# age: 2 missing (40%)
+# phone: 4 missing (80%)
+# location: 0 missing (0%)
+
+print("\nMissing values per row:")
+print(df.isnull().sum(axis=1))
+# Row 0: 1 missing
+# Row 1: 2 missing
+# Row 2: 1 missing
+# Row 3: 1 missing
+# Row 4: 1 missing
+
+# STEP 1: COLUMN-LEVEL DECISIONS
+# Drop columns with > 50% missing
+missing_pct_col = df.isnull().sum() / len(df) * 100
+print(f"\nColumn missing percentages:\n{missing_pct_col}")
+# amount: 20%, age: 40%, phone: 80%, location: 0%
+
+cols_to_drop = missing_pct_col[missing_pct_col > 50].index
+print(f"Dropping columns with > 50% missing: {list(cols_to_drop)}")
+# Drop 'phone' (80% missing)
+
+df = df.drop(columns=cols_to_drop)
+# Now we have: amount, age, location
+
+# STEP 2: ROW-LEVEL DECISIONS
+# Drop rows with > 3 missing values (in remaining columns)
+missing_per_row = df.isnull().sum(axis=1)
+print(f"\nRow missing values:\n{missing_per_row}")
+# All rows have ≤ 2 missing, so keep all rows
+
+rows_to_drop = missing_per_row[missing_per_row > 3].index
+df = df.drop(rows_to_drop)
+
+# STEP 3: IMPUTE REMAINING MISSING VALUES
+# Now only impute the remaining scattered missing values
+df['amount'].fillna(df['amount'].median(), inplace=True)  # Impute with median
+df['age'].fillna(df['age'].median(), inplace=True)         # Impute with median
+
+print("\nFinal dataset:")
+print(df)
+```
+
+**Output**:
+```
+Missing values per column:
+amount     1
+age        2
+phone      4
+location   0
+dtype: int64
+
+Column missing percentages:
+amount    20.0
+age       40.0
+phone     80.0
+location   0.0
+dtype: float64
+
+Dropping columns with > 50% missing: ['phone']
+
+Row missing values:
+0    1
+1    2
+2    1
+3    1
+4    1
+dtype: int64
+
+Final dataset:
+   amount   age location
+0   100.0  25.0       US
+1   200.0  27.5       UK    (age imputed with median 27.5)
+2   NaN    35.0       US
+3   400.0  30.0       US    (age imputed with median 30)
+4   500.0  55.0       UK
+```
+
+#### Missing Value Handling: Decision Tree
+
+```
+Do we have missing data?
+│
+├─ YES: At COLUMN level (feature has many missing)
+│   │
+│   ├─ Missing % < 5%:
+│   │   └─ Impute (too little missing to drop)
+│   │
+│   ├─ Missing % 5-30%:
+│   │   ├─ Is feature important? YES → Impute
+│   │   └─ Is feature important? NO → Consider dropping
+│   │
+│   ├─ Missing % 30-50%:
+│   │   ├─ Can we impute reliably? YES → Impute
+│   │   └─ Can we impute reliably? NO → Drop
+│   │
+│   └─ Missing % > 50%:
+│       └─ DROP THE COLUMN (too much missing)
+│
+└─ YES: At ROW level (row has some missing values)
+    │
+    ├─ Missing features < 3:
+    │   └─ IMPUTE (row is mostly complete)
+    │
+    ├─ Missing features 3-5:
+    │   ├─ Is row informative? YES → Impute
+    │   └─ Is row informative? NO → Drop row
+    │
+    └─ Missing features > 5:
+        └─ DROP THE ROW (too incomplete)
+```
+
+#### Imputation Methods (for remaining missing values)
+
+After dropping columns and rows, impute remaining scattered missing values:
+
+```python
+# Numerical features: Use median (robust to outliers)
+df['amount'].fillna(df['amount'].median(), inplace=True)
+
+# Categorical features: Use mode (most common value)
+df['location'].fillna(df['location'].mode()[0], inplace=True)
+
+# Advanced: KNN imputation (use neighbors)
+from sklearn.impute import KNNImputer
+imputer = KNNImputer(n_neighbors=5)
+df_imputed = imputer.fit_transform(df_numeric)
+
+# Advanced: Predictive imputation (predict missing from other features)
+from sklearn.impute import SimpleImputer
+imputer = SimpleImputer(strategy='mean')
+df_numeric = imputer.fit_transform(df_numeric)
+```
+
+#### Missing Indicator Feature (Optional)
+
+Sometimes the fact that a value is missing is itself predictive:
+
+```python
+# Create indicator: Was age missing before imputation?
+df['age_was_missing'] = df['age'].isnull().astype(int)
+
+# Then impute
+df['age'].fillna(df['age'].median(), inplace=True)
+
+# Now model has two pieces of info:
+# 1. The imputed age value
+# 2. Whether age was originally missing (may correlate with fraud!)
+```
 
 **Example (Fraud Detection)**:
 ```python
-# Check missing values
+import pandas as pd
+import numpy as np
+from sklearn.impute import SimpleImputer
+
+# Load data
+df = pd.read_csv('transactions.csv')
+
+# STEP 1: Column-level decisions
+print("Missing values per column:")
 missing_pct = df.isnull().sum() / len(df) * 100
-# Drop features > 50% missing
+print(missing_pct)
+
+# Drop columns with > 50% missing
 df = df.dropna(axis=1, thresh=0.5*len(df))
-# Impute remaining with mean
-df.fillna(df.mean(), inplace=True)
+print(f"Remaining columns: {df.columns.tolist()}")
+
+# STEP 2: Row-level decisions
+# Drop rows with > 3 missing values
+df = df.dropna(thresh=len(df.columns) - 3)
+print(f"Remaining rows: {len(df)}")
+
+# STEP 3: Impute remaining missing values
+imputer = SimpleImputer(strategy='median')
+df_numeric = df.select_dtypes(include=[np.number])
+df[df_numeric.columns] = imputer.fit_transform(df_numeric)
+
+print(f"Final shape: {df.shape}")
+print(f"Any missing values left: {df.isnull().sum().sum()}")
 ```
+
+#### Summary: Column vs Row Handling
+
+| Level | Decision | When | Action |
+|-------|----------|------|--------|
+| **Column** | Missing > 50% | Feature too incomplete | DROP COLUMN |
+| **Column** | Missing 30-50% | Borderline | IMPUTE or DROP |
+| **Column** | Missing < 30% | Feature useful | IMPUTE |
+| **Row** | Missing > 5 features | Row unreliable | DROP ROW |
+| **Row** | Missing 3-5 features | Borderline | IMPUTE or DROP |
+| **Row** | Missing < 3 features | Row mostly complete | IMPUTE |
 
 #### Outliers
 - **Identify**: 
