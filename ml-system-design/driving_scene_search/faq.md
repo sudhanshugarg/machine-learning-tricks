@@ -23,6 +23,7 @@ This is a **living FAQ** for [design.md](design.md) / [solution.md](solution.md)
 | 5 | 2026-07-13 | What are "perception stack detections"? What information do they contain, and what do some concrete examples look like? | `[ANSWERED]` | Terminology | [solution.md](solution.md) Step 4A |
 | 6 | 2026-07-13 | In batch-based contrastive learning, how do we prevent true positives from being treated as negatives? What if two captions match the same video? | `[ANSWERED]` | Math / Architecture | [solution.md](solution.md) Step 4A |
 | 7 | 2026-07-13 | What exactly are "image tokens" or "video tokens"? I understand text tokens, but image/video tokens are confusing — aren't images just RGB pixels? | `[ANSWERED]` | Terminology | [solution.md](solution.md) Step 4A |
+| 8 | 2026-07-13 | In Step 4C long-tail mining, the seed-based approach assumes you know what to look for. What about automatically finding rare scenarios via clustering or other unsupervised methods? | `[ANSWERED]` | Architecture | [solution.md](solution.md) Step 4C |
 
 *(Append new rows as questions come in.)*
 
@@ -682,4 +683,251 @@ The term "token" in vision is basically a historical accident — when Dosovitsk
 
 ## Follow-up / Interview Extensions
 
-*(No questions logged yet.)*
+### Q: In Step 4C long-tail mining, the seed-based approach assumes you know what to look for. What about automatically finding rare scenarios via clustering or other unsupervised methods? `[ANSWERED]`
+
+**A:**
+
+Excellent point — the "seed → retrieve → diversify" approach (Step 4C, section 5) is **reactive**: you have to already know or suspect a scenario type exists before you can mine it. But you want to also **proactively discover unknown rare scenarios** that haven't been explicitly labeled yet. Here are multiple unsupervised/semi-supervised approaches that complement the seed-based mining:
+
+### 1. **Embedding-Space Clustering (what you suggested)**
+
+Cluster all video embeddings in the archive (billions of them) using a scalable clustering algorithm, then identify clusters with small populations — those are your long-tail scenario candidates.
+
+```python
+from sklearn.cluster import MiniBatchKMeans
+import numpy as np
+
+# Assume embeddings is a (N_videos, 512) array
+embeddings = load_all_embeddings()  # billions of embeddings, precomputed
+N_clusters = 5000  # tune based on archive size / desired granularity
+
+# Cluster via MiniBatchKMeans (handles streaming/large-scale data)
+kmeans = MiniBatchKMeans(n_clusters=N_clusters, batch_size=10000)
+cluster_labels = kmeans.fit_predict(embeddings)
+
+# Count cluster populations
+cluster_sizes = np.bincount(cluster_labels)
+sparse_clusters = np.argsort(cluster_sizes)[:100]  # bottom 100 clusters
+
+# Mining: sample a few videos from each sparse cluster
+for cluster_id in sparse_clusters:
+    videos_in_cluster = embeddings[cluster_labels == cluster_id]
+    # Diversity-sample within the cluster (don't just take the first K)
+    sample_idxs = farthest_point_sample(videos_in_cluster, k=5)
+    route_to_human_review(sample_idxs)
+```
+
+**Why this works:**
+- Dense clusters = common scenarios (highway driving, normal intersections).
+- Sparse clusters = rare/unusual scenarios (cyclists behaving oddly, unusual weather, edge-case maneuvers).
+- The embedding space captures semantic similarity, so "nearby videos in the cluster" are similar scenarios (preventing near-duplicate over-representation).
+
+**Limitations:**
+- You lose interpretability — you have a cluster ID, but what scenario *is* it? Humans need to manually inspect to understand.
+- Clusters depend on how the embedding model was trained — if the model doesn't distinguish a particular rare scenario type, it might cluster it together with common scenarios (the model doesn't know to separate them).
+- Computational cost is high (clustering billions of vectors), though approximations (hierarchical clustering, HNSW-based clustering) make it feasible.
+
+### 2. **Novelty/Anomaly Detection in Embedding Space**
+
+Instead of clustering all videos, directly identify embedding-space **outliers** — videos whose embeddings are far from the dense center of the distribution. These outliers are often the rare/unusual scenarios.
+
+```python
+from sklearn.covariance import EllipticEnvelope
+
+embeddings = load_all_embeddings()
+
+# Fit an elliptic envelope (robust covariance estimator) on a sample
+# to define the "normal" region of embedding space
+robust_cov = EllipticEnvelope(contamination=0.05)  # assume 5% outliers
+predictions = robust_cov.predict(embeddings)  # -1 = outlier, +1 = inlier
+
+outlier_idxs = np.where(predictions == -1)[0]
+anomaly_scores = robust_cov.mahalanobis(embeddings)  # distance from center
+
+# Sort by anomaly score and mine the most anomalous videos
+top_anomalies = np.argsort(anomaly_scores)[-1000:]
+route_to_human_review(top_anomalies)
+```
+
+**Why this works:**
+- No need to know the clusters or what makes a scenario rare — the model just flags "this video is unusual."
+- Better for truly novel scenarios that don't fit into any predefined category.
+- Mahalanobis distance accounts for the shape of the embedding distribution (correlated feature axes), not just raw distance.
+
+**Limitation:**
+- Only finds outliers, not rare-but-dense clusters (a scenario type that's rare *globally* but has its own dense cluster won't be flagged).
+- Prone to false positives: a video with unusual visual properties (very dark, very blurry, rare camera angle) will be flagged as anomalous even if the *scenario* is routine.
+
+### 3. **Disengagement/Intervention-Triggered Mining** (from post-incident system)
+
+Find all segments immediately preceding a **safety-driver disengagement, an automated intervention, or a planner replan**. These are disproportionately likely to contain edge-case/rare scenarios that the planned system couldn't handle.
+
+```python
+# Assume we have event logs: timestamp → event type → vehicle_id
+events = load_fleet_events()
+
+rare_scenarios = []
+for event in events:
+    if event.type in ['disengagement', 'intervention', 'large_replan']:
+        # Look back 5-10 seconds before the event
+        clip_id = get_clip_by_timestamp(event.vehicle_id, event.timestamp - 7.5)
+        rare_scenarios.append(clip_id)
+
+# These clips are high-signal: they already triggered an exception
+route_to_human_review(rare_scenarios)
+```
+
+**Why this works:**
+- Direct signal: if the planning system threw an exception or a human had to take over, something unusual happened.
+- No need for embeddings or clustering — just use metadata/event logs.
+- Extremely high precision (very few false positives): if something caused a disengagement, it's *definitely* interesting.
+
+**Limitation:**
+- Disengagement/intervention is rare (you want to minimize these in production safety), so this only finds the most severe edge cases, not all long-tail scenarios.
+- Missing subtler long-tail cases that don't trigger interventions (e.g., a scenario the planner handled OK but suboptimally).
+
+### 4. **Distribution Shift Detection: Compare Against Training Set**
+
+If you have a known training set of "safe/representative scenarios," identify archive videos whose embeddings are **far from the training distribution**. These are the scenarios you didn't sufficiently cover during training.
+
+```python
+training_embeddings = load_training_set_embeddings()  # known good/representative
+archive_embeddings = load_all_embeddings()
+
+# Fit a density estimator (KDE, Gaussian Mixture Model) on training set
+from scipy.stats import gaussian_kde
+kde = gaussian_kde(training_embeddings.T)
+
+# Score each archive video by its likelihood under the training distribution
+likelihood_scores = kde(archive_embeddings.T)
+
+# Low likelihood = different from training set
+out_of_distribution_idxs = np.argsort(likelihood_scores)[:1000]
+route_to_human_review(out_of_distribution_idxs)
+```
+
+**Why this works:**
+- Directly targets the problem: find scenarios not sufficiently covered in training.
+- Interpretable: "this scenario is unlike our training data."
+- Leverages existing domain knowledge (what's in the training set).
+
+**Limitation:**
+- Requires a well-curated training set to compare against (itself a long-tail mining problem in earlier iterations).
+- KDE/GMM scale poorly to high dimensions (curse of dimensionality); approximations (sampling-based, tree-based) needed.
+
+### 5. **Diversity-First Sampling (Greedy Farthest-Point)**
+
+Ignore clustering and simply greedily sample videos that **maximize diversity in embedding space**. Start with one random video, then iteratively add the video farthest from all previously selected videos.
+
+```python
+embeddings = load_all_embeddings()
+selected_idxs = []
+
+# Start with one random video
+selected_idxs.append(np.random.randint(len(embeddings)))
+
+# Greedily add the farthest unselected video
+for _ in range(1000):  # select 1000 diverse videos
+    distances = np.linalg.norm(
+        embeddings - embeddings[selected_idxs].mean(axis=0),
+        axis=1
+    )
+    # Exclude already-selected
+    distances[selected_idxs] = -np.inf
+    next_idx = np.argmax(distances)
+    selected_idxs.append(next_idx)
+
+route_to_human_review(selected_idxs)
+```
+
+**Why this works:**
+- No assumptions about what makes a scenario rare — just maximize coverage of embedding space.
+- Very high diversity by construction (no near-duplicates).
+- Simple and interpretable: "pick videos that are maximally different from each other."
+
+**Limitation:**
+- Not specifically targeting *rare* scenarios, just *diverse* ones — you might pick 1000 diverse examples that are all still from common scenario types if those happen to have a large embedding-space spread.
+- Greedy approach doesn't guarantee global optimum (NP-hard problem).
+
+### 6. **Uncertainty Sampling from a Lightweight Long-Tail Classifier**
+
+Train a binary classifier (rare vs. common) on a small seed set of human-labeled examples, then find videos where the classifier is most **uncertain** (confidence near 0.5). Those uncertain examples are either boundary cases or represent novel rare scenarios the classifier hasn't seen.
+
+```python
+# Start with a small labeled set
+labeled_videos = load_human_labeled_examples()  # (video_id, is_rare) pairs
+
+# Train a lightweight classifier (e.g., logistic regression over embeddings)
+X = embeddings[labeled_videos['video_ids']]
+y = labeled_videos['is_rare_labels']
+clf = LogisticRegression().fit(X, y)
+
+# Score all videos
+probabilities = clf.predict_proba(embeddings)[:, 1]  # P(rare)
+uncertainties = np.abs(probabilities - 0.5)  # closest to 0.5 = most uncertain
+
+# Sample uncertain videos for labeling
+uncertain_idxs = np.argsort(uncertainties)[:500]
+route_to_human_review(uncertain_idxs)
+```
+
+**Why this works:**
+- Combines supervised (human labels) and unsupervised (embedding space) signals.
+- Active learning loop: each labeling round refines the classifier, so you converge on the true long-tail boundary.
+- Handles both rare examples and boundary cases (which may reveal model limitations).
+
+**Limitation:**
+- Requires bootstrapping with human labels (a cold-start problem, but smaller than full-dataset labeling).
+- Assumes the classifier can generalize from seed examples (true if the rare/common distinction is clear, false if it's subtle).
+
+### 7. **Multi-Modal Edge-Case Mining: Perception ↔ Planning Disagreement**
+
+Find videos where **perception and planning outputs disagree significantly** — e.g., Perception detected an object with low confidence, but Planning reacted (replanned, braked). This suggests a scenario the system found ambiguous, which is exactly the kind of thing worth including in training.
+
+```python
+# Requires access to full pipeline outputs (not just embeddings)
+for clip_id in all_clips:
+    perception_output = get_perception(clip_id)
+    planning_output = get_planning(clip_id)
+    
+    # Find agents Perception detected with low confidence
+    low_conf_detections = [d for d in perception_output.detections 
+                           if d.confidence < 0.7]
+    
+    # Did Planning still account for them (e.g., replan or brake)?
+    planning_replan_magnitude = compute_replan_magnitude(planning_output)
+    
+    if low_conf_detections and planning_replan_magnitude > threshold:
+        # Perception uncertainty + Planning caution = interesting scenario
+        route_to_human_review(clip_id)
+```
+
+**Why this works:**
+- Targets the *practical* problem: scenarios that cause system uncertainty.
+- Doesn't require embedding distances or clustering — uses explicit system outputs.
+- Finds scenarios where the system behaves conservatively, which reveals its limitations.
+
+**Limitation:**
+- Requires access to full pipeline logs (not just archived videos), which may not be available for all clips in the archive.
+- Heuristic-based (thresholds for "low confidence," "large replan") — tuning needed.
+
+### Recommended **combined approach** for this system:
+
+1. **Seed-based mining** (existing Step 4C approach) — when you have a known scenario type to focus on.
+2. **Clustering + sparse clusters** (approach #1) — automated bulk discovery; run periodically (weekly/monthly) to identify emergent rare scenario clusters.
+3. **Anomaly detection** (approach #2) — continuous background signal; flag outliers as they appear in new fleet data.
+4. **Disengagement-triggered** (approach #3) — the highest-signal rare-event detector; always mine immediately around safety-driver interventions.
+5. **Diversity-first sampling** (approach #5) — if you just want a *representative sample* of the archive's diversity, not specifically rare scenarios.
+
+For the Waymo system, I'd weight them as:
+- **Disengagement-triggered** (immediate, high-precision)
+- **Clustering sparse clusters** (bulk discovery, weekly batch)
+- **Anomaly detection** (continuous monitoring)
+- **Seed-based** (on-demand for engineers investigating specific scenarios)
+- **Diversity-first** (as a fallback for constructing balanced evaluation sets)
+
+This multi-method approach ensures you catch rare scenarios across multiple signals (embedding space, explicit system outputs, human interventions), rather than relying on one mechanism that might miss important edge cases.
+
+*Pointer:* [solution.md](solution.md), Step 4C "Long-Tail Data Sampling for Training Sets" — sections 1–6 (especially section 6 on discovering unknown scenarios).
+
+---
