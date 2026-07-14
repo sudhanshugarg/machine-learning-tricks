@@ -2704,71 +2704,589 @@ def score_transaction(transaction):
 
 **Answer:**
 
-#### Data Processing Tools
+Let me explain the most important technologies: **Spark, Beam, Airflow, and Prefect**. These are the foundation of modern ML data pipelines.
 
-| Tool | Use Case | Pros | Cons |
-|------|----------|------|------|
-| **Apache Spark** | Large-scale batch processing | Distributed, fast, SQL support | Complex setup |
-| **Apache Beam** | Batch + streaming pipelines | Unified API | Steeper learning curve |
+---
+
+## Data Processing Tools
+
+### Apache Spark
+
+**What it is**: Distributed computing framework for large-scale data processing (batch and streaming)
+
+**When to use**:
+- Processing 100GB+ of data
+- Need to parallelize computations across multiple machines
+- Working with structured data (SQL-like queries)
+- Both batch processing needs
+
+**Pros**:
+- Extremely fast (in-memory distributed computing)
+- Handles huge datasets (petabyte-scale)
+- SQL support (Spark SQL)
+- Streaming support (Spark Streaming)
+- Industry standard (Meta, Uber, Netflix, Airbnb use it)
+- Python/Scala/Java/SQL APIs
+
+**Cons**:
+- Complex to set up and maintain
+- High memory overhead
+- Steep learning curve
+- Overkill for small datasets (< 10GB)
+
+**Example: Daily Feature Generation**
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import window, count, sum, avg
+
+# Initialize Spark
+spark = SparkSession.builder \
+    .appName("FraudDetection") \
+    .config("spark.sql.shuffle.partitions", 200) \
+    .getOrCreate()
+
+# Load transaction data (parquet from S3)
+df = spark.read.parquet("s3://my-bucket/transactions/")
+
+# Aggregate user features (group by user_id, compute stats)
+user_features = df.groupBy("user_id").agg({
+    "amount": ["sum", "avg", "stddev"],
+    "transaction_id": "count",
+    "merchant_id": "nunique"
+}).withColumnRenamed("count(transaction_id)", "txn_count")
+
+# Compute time-window features (velocity)
+velocity_features = df.groupBy(
+    window("timestamp", "24 hours"),
+    "user_id"
+).agg(
+    count("transaction_id").alias("txn_24h"),
+    sum("amount").alias("amount_24h")
+)
+
+# Write output to data warehouse
+user_features.write \
+    .mode("overwrite") \
+    .parquet("s3://my-bucket/features/user_features/")
+
+print(f"Generated features for {user_features.count()} users")
+```
+
+**Typical Use Case** (Fraud Detection):
+```
+Raw transactions (100GB in S3)
+    ↓ (Spark: Parallelize across 100 machines)
+Clean & validate
+    ↓
+Compute aggregates (1-day, 7-day, 30-day windows)
+    ↓
+User features: avg_amount, std_dev, velocity
+    ↓
+Output (parquet to S3, loaded into BigQuery)
+    ↓
+Used for training (next day)
+```
+
+---
+
+### Apache Beam
+
+**What it is**: Unified framework for batch AND streaming data processing with the same code
+
+**When to use**:
+- Need same code for batch AND streaming
+- Processing unbounded data streams (Kafka, Pub/Sub)
+- Want flexibility to switch between batch and streaming
+- Building real-time feature pipelines
+
+**Pros**:
+- Write once, run anywhere (same pipeline for batch and streaming)
+- Multiple language support (Python, Java, Go)
+- Cloud-agnostic (Google Cloud, AWS, on-prem)
+- Excellent for real-time feature computation
+- Built-in windowing (tumbling, sliding, session windows)
+
+**Cons**:
+- Steeper learning curve than Spark
+- Smaller ecosystem (fewer libraries)
+- Less mature than Spark
+- Harder to debug
+
+**Example: Real-Time Velocity Feature Computation**
+```python
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions
+from apache_beam.transforms.window import FixedWindows
+import json
+
+# Window: compute features over 1-hour tumbling windows
+class ComputeVelocity(beam.DoFn):
+    def process(self, element):
+        """Compute velocity features from transaction stream"""
+        user_id = element['user_id']
+        timestamp = element['timestamp']
+        amount = element['amount']
+        
+        # This runs on windowed data (e.g., all txns in 1 hour for user)
+        yield {
+            'user_id': user_id,
+            'timestamp': timestamp,
+            'velocity_1h': 1,  # Count of transactions
+            'amount_1h': amount
+        }
+
+# Build pipeline
+options = PipelineOptions()
+with beam.Pipeline(options=options) as p:
+    (p 
+     | 'Read from Kafka' >> beam.io.kafka.ReadFromKafka(
+         consumer_config={"bootstrap.servers": "kafka:9092"},
+         topics=['transactions']
+     )
+     | 'Parse JSON' >> beam.Map(lambda x: json.loads(x[1]))
+     
+     # Tumbling window: 1 hour
+     | 'Window 1h' >> beam.WindowInto(FixedWindows(3600))
+     
+     | 'Compute Features' >> beam.ParDo(ComputeVelocity())
+     
+     # Write to feature store (Redis)
+     | 'Write to Redis' >> beam.Map(
+         lambda x: redis_client.set(
+             f"velocity:{x['user_id']}", 
+             json.dumps(x)
+         )
+     )
+    )
+```
+
+**Typical Use Case** (Fraud Detection):
+```
+Stream of transactions (Kafka, 1000 txns/sec)
+    ↓ (Beam: real-time processing)
+Tumbling windows (1-hour buckets)
+    ↓
+For each user in window:
+  - Count transactions
+  - Sum amounts
+  - Track unique merchants
+    ↓
+Write to Redis (fast lookup in scoring)
+    ↓
+Decision service uses these features IMMEDIATELY
+```
+
+---
+
+### Spark vs Beam: Choosing Between Them
+
+| Aspect | Spark | Beam |
+|--------|-------|------|
+| **Primary use** | Batch (daily jobs) | Stream (real-time) |
+| **Latency** | Hours to minutes | Seconds to minutes |
+| **Maturity** | 10+ years | 5+ years |
+| **Ecosystem** | Huge | Growing |
+| **Learning curve** | Medium | Steep |
+| **Best for** | Historical data, training features | Real-time online features |
+| **Example** | Daily aggregates (30-day avg amount) | Hourly velocity (txns in last 1h) |
+
+**Decision Framework**:
+```
+Do you need real-time features?
+├─ NO (batch retraining only) → Use Spark
+└─ YES (for online scoring) → Use Beam
+```
+
+---
+
+## Orchestration Tools
+
+### Apache Airflow
+
+**What it is**: Workflow orchestration platform for scheduling and monitoring data pipelines
+
+**When to use**:
+- Need to schedule tasks (daily, hourly, weekly)
+- Tasks have dependencies (Task A must finish before B)
+- Need monitoring and error alerting
+- Building complex ML pipelines with multiple stages
+
+**Pros**:
+- Industry standard (Airbnb, Stripe, Lyft, Uber use it)
+- Rich ecosystem (SparkSubmit, KubernetesPod, Bash, Python operators)
+- Beautiful UI for monitoring and debugging
+- Python-based (easy to write DAGs)
+- Excellent error handling and retries
+
+**Cons**:
+- Steep learning curve (DAG concept, Airflow architecture)
+- Complex to deploy and maintain
+- Slow for real-time workflows (designed for batch)
+- Can be heavy for simple tasks
+
+**Example: Daily Fraud Model Retraining Pipeline**
+```python
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'ml-team',
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+    'email_on_failure': ['alerts@company.com'],
+}
+
+dag = DAG(
+    'fraud_model_retraining',
+    default_args=default_args,
+    description='Daily fraud model retraining pipeline',
+    schedule_interval='0 2 * * *',  # Daily at 2 AM
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+)
+
+# Task 1: Generate features using Spark (30 mins)
+generate_features = SparkSubmitOperator(
+    task_id='generate_features',
+    application='s3://my-bucket/jobs/feature_generation.py',
+    conf={'spark.executor.memory': '4g'},
+    dag=dag,
+)
+
+# Task 2: Train model using Python (10 mins)
+def train_model_func():
+    import xgboost as xgb
+    import pandas as pd
+    
+    print("Loading training data...")
+    X_train = pd.read_parquet("s3://my-bucket/features/")
+    y_train = pd.read_parquet("s3://my-bucket/labels/")
+    
+    print("Training XGBoost model...")
+    model = xgb.XGBClassifier(
+        max_depth=6,
+        learning_rate=0.1,
+        n_estimators=500,
+        scale_pos_weight=1000,  # For fraud (rare class)
+    )
+    model.fit(X_train, y_train)
+    
+    # Save model
+    model.save_model("/tmp/fraud_model_v2.pkl")
+    print("Model saved to /tmp/fraud_model_v2.pkl")
+
+train_model = PythonOperator(
+    task_id='train_model',
+    python_callable=train_model_func,
+    dag=dag,
+)
+
+# Task 3: Evaluate model (5 mins)
+def evaluate_model_func():
+    import xgboost as xgb
+    import pandas as pd
+    from sklearn.metrics import roc_auc_score
+    
+    print("Evaluating model...")
+    model = xgb.XGBClassifier()
+    model.load_model("/tmp/fraud_model_v2.pkl")
+    
+    # Load test data
+    X_test = pd.read_parquet("s3://my-bucket/test_features/")
+    y_test = pd.read_parquet("s3://my-bucket/test_labels/")
+    
+    # Compute AUC
+    y_pred = model.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, y_pred)
+    
+    print(f"Model AUC: {auc:.4f}")
+    
+    # Compare to baseline
+    baseline_auc = 0.93
+    if auc < baseline_auc:
+        raise Exception(f"Model AUC {auc} < baseline {baseline_auc}")
+    
+    return auc
+
+evaluate_model = PythonOperator(
+    task_id='evaluate_model',
+    python_callable=evaluate_model_func,
+    dag=dag,
+)
+
+# Task 4: Deploy to canary (2 mins)
+def deploy_canary_func():
+    print("Deploying model to canary (5% traffic)...")
+    # Update model serving config to route 5% to new model
+    import subprocess
+    subprocess.run([
+        'kubectl', 'set', 'env', 'deployment/fraud-scorer',
+        'MODEL_VERSION=v2',
+        'CANARY_TRAFFIC_PCT=5'
+    ])
+    print("Deployed successfully!")
+
+deploy_canary = PythonOperator(
+    task_id='deploy_canary',
+    python_callable=deploy_canary_func,
+    dag=dag,
+)
+
+# Define task dependencies (DAG)
+generate_features >> train_model >> evaluate_model >> deploy_canary
+```
+
+**DAG Visualization** (Airflow UI):
+```
+generate_features (Spark, 30min)
+        ↓
+   train_model (Python, 10min)
+        ↓
+  evaluate_model (Python, 5min)
+        ↓
+  deploy_canary (K8s, 2min)
+
+Total time: ~47 minutes (2:00 AM - 2:47 AM)
+If any task fails → Retry 2x or alert
+```
+
+**What Airflow Does**:
+- ✅ Schedules job to run daily at 2 AM
+- ✅ Runs tasks in correct order (enforce dependencies)
+- ✅ Retries failed tasks automatically
+- ✅ Sends alerts if pipeline fails
+- ✅ Logs all task outputs for debugging
+- ✅ Beautiful UI to monitor all pipelines
+
+---
+
+### Prefect
+
+**What it is**: Modern workflow orchestration platform (designed as a better alternative to Airflow)
+
+**When to use**:
+- Prefer cleaner, more Pythonic code
+- Need better developer experience
+- Want cloud-native orchestration
+- Building data pipelines with better error handling
+
+**Pros**:
+- Much cleaner API (functions instead of Airflow DAG complexity)
+- Better error handling and retry logic
+- Cloud-native (Prefect Cloud is fully managed)
+- Easier to test (pure Python functions)
+- Modern UI and better UX than Airflow
+- Better dependency management
+
+**Cons**:
+- Newer ecosystem (smaller community than Airflow)
+- Less mature
+- Fewer third-party integrations
+- Not as widely adopted in enterprises yet
+
+**Example: Same ML Pipeline as Airflow**
+```python
+from prefect import flow, task
+from prefect.tasks.shell import ShellTask
+from datetime import timedelta
+
+# Define individual tasks
+@task(
+    name="Generate Features",
+    retries=2,
+    retry_delay_seconds=300,
+    tags=["spark"]
+)
+def generate_features():
+    """Run Spark job to generate features"""
+    print("Generating features from last 30 days...")
+    # Run Spark job
+    import subprocess
+    result = subprocess.run([
+        "spark-submit",
+        "s3://my-bucket/jobs/feature_generation.py"
+    ])
+    if result.returncode != 0:
+        raise Exception("Feature generation failed")
+    return "features_ready"
+
+@task(
+    name="Train Model",
+    retries=1,
+    retry_delay_seconds=60,
+    tags=["ml"]
+)
+def train_model(features_status: str):
+    """Train XGBoost model"""
+    print(f"Training model... (features: {features_status})")
+    import xgboost as xgb
+    import pandas as pd
+    
+    X_train = pd.read_parquet("s3://my-bucket/features/")
+    y_train = pd.read_parquet("s3://my-bucket/labels/")
+    
+    model = xgb.XGBClassifier(
+        max_depth=6,
+        learning_rate=0.1,
+        scale_pos_weight=1000,
+    )
+    model.fit(X_train, y_train)
+    model.save_model("/tmp/fraud_model_v2.pkl")
+    
+    return "model_v2"
+
+@task(
+    name="Evaluate Model",
+    tags=["ml"]
+)
+def evaluate_model(model_name: str):
+    """Evaluate model performance"""
+    print(f"Evaluating {model_name}...")
+    import xgboost as xgb
+    import pandas as pd
+    from sklearn.metrics import roc_auc_score
+    
+    model = xgb.XGBClassifier()
+    model.load_model(f"/tmp/{model_name}.pkl")
+    
+    X_test = pd.read_parquet("s3://my-bucket/test_features/")
+    y_test = pd.read_parquet("s3://my-bucket/test_labels/")
+    
+    y_pred = model.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, y_pred)
+    
+    print(f"Model AUC: {auc:.4f}")
+    
+    if auc < 0.93:
+        raise Exception(f"Model AUC {auc} too low")
+    
+    return auc
+
+@task(
+    name="Deploy Canary",
+    tags=["deployment"]
+)
+def deploy_canary(model_name: str):
+    """Deploy model to canary (5% traffic)"""
+    print(f"Deploying {model_name} to canary...")
+    import subprocess
+    subprocess.run([
+        "kubectl", "set", "env", "deployment/fraud-scorer",
+        f"MODEL_VERSION={model_name}",
+        "CANARY_TRAFFIC_PCT=5"
+    ])
+    return "deployed"
+
+# Define the workflow (just function calls!)
+@flow(
+    name="Fraud Model Retraining",
+    description="Daily fraud model retraining pipeline",
+    schedule="0 2 * * *",  # Daily at 2 AM
+)
+def fraud_model_pipeline():
+    """Main pipeline orchestration"""
+    features = generate_features()
+    model = train_model(features)
+    auc = evaluate_model(model)
+    deployment = deploy_canary(model)
+    return deployment
+
+# Run the pipeline
+if __name__ == "__main__":
+    fraud_model_pipeline()
+```
+
+**Advantages over Airflow**:
+```
+Airflow approach:
+  - Must define DAG class
+  - Complex imports and operators
+  - Hard to test (operators are abstract)
+  - Lots of boilerplate
+
+Prefect approach:
+  - Just decorate functions with @task
+  - Simple function calls for dependencies
+  - Easy to test (just call functions!)
+  - Minimal boilerplate
+```
+
+---
+
+### Airflow vs Prefect: Choosing Between Them
+
+| Aspect | Airflow | Prefect |
+|--------|---------|---------|
+| **Maturity** | 10+ years (very stable) | 5+ years (modern) |
+| **Community** | Very large (industry standard) | Growing |
+| **Code style** | Operators & DAGs (complex) | Functions (simple) |
+| **Testing** | Difficult | Easy (just call functions) |
+| **Deployment** | Self-hosted | Cloud-native (Prefect Cloud) |
+| **Learning curve** | Steep | Moderate |
+| **Adoption** | Enterprise standard | Growing adoption |
+
+**Decision**:
+```
+First project? → Start with Prefect (easier learning curve)
+Enterprise requirement? → Use Airflow (maturity + adoption)
+Want simplicity? → Prefect
+Need ecosystem maturity? → Airflow
+```
+
+---
+
+## Recommended ML Pipeline Stack
+
+### For Fraud Detection System:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           FRAUD DETECTION SYSTEM STACK                  │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│ Real-Time Scoring Path:                                │
+│   Kafka (events) → Beam (velocity) → Redis → Scorer   │
+│                                                          │
+│ Batch Training Path:                                    │
+│   S3 (raw) → Spark (features) → Training → BentoML    │
+│                                                          │
+│ Orchestration:                                          │
+│   Airflow (schedule daily jobs)                        │
+│                                                          │
+│ Monitoring:                                             │
+│   Prometheus + Grafana                                  │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Component Selection:
+
+```
+Ingestion:         Kafka (streaming at scale)
+Stream Processing: Beam (real-time features)
+Batch Processing:  Spark (daily aggregates)
+Orchestration:     Prefect (easy) or Airflow (enterprise)
+Feature Store:     Feast + Redis (manage + serve)
+Training:          Spark MLlib + Python XGBoost
+Model Serving:     BentoML or FastAPI
+Monitoring:        Prometheus + Grafana
+```
+
+---
+
+## Other Important Tools (Brief Overview)
+
+| Tool | Purpose | Pros | Cons |
+|------|---------|------|------|
 | **Kafka** | Real-time event streaming | Low latency, scalable | Operational complexity |
 | **dbt** | SQL transformations | Version control for SQL | SQL-only |
+| **Feast** | Feature store | Open-source, free | Limited enterprise features |
+| **MLflow** | Experiment tracking | Free, simple | Limited feature store |
+| **Prometheus + Grafana** | Monitoring & alerting | Industry standard | Manual setup |
 
-**Choice for Fraud Detection**:
-- Ingestion: **Kafka** (streaming events)
-- Batch Transform: **Spark SQL** or **BigQuery SQL**
-- Orchestration: **Airflow**
-
-#### Feature Store Tools
-
-| Tool | Purpose | Pros | Cons |
-|------|---------|------|------|
-| **Feast** | Open-source feature store | Free, good docs, community | Limited enterprise features |
-| **Tecton** | Enterprise feature store | Fully managed, UI | Expensive |
-| **DynamoDB/Redis** | Custom feature store | Simple, cheap | DIY engineering |
-
-**Choice**: Start with Redis + Feast (open-source + cost-effective)
-
-#### Model Serving Tools
-
-| Tool | Use Case | Pros | Cons |
-|------|----------|------|------|
-| **Seldon** | Kubernetes-native serving | Open-source, flexible | Complex |
-| **KServe** | Kubernetes serving | Good for k8s | Kubeflow dependency |
-| **BentoML** | Multi-framework serving | Easy deployment, no k8s required | Less powerful |
-| **FastAPI** | Custom Python server | Simple, fast, type-safe | Manual scaling |
-
-**Choice for Fraud Detection**: **BentoML** or **FastAPI** (simple, fast)
-
-#### Experiment Tracking & MLOps
-
-| Tool | Purpose | Pros | Cons |
-|------|---------|------|------|
-| **MLflow** | Track experiments, models, parameters | Free, simple, widely used | Limited feature store |
-| **Weights & Biases** | Experiment tracking + dashboards | Beautiful UI, good integrations | Paid (free tier small) |
-| **Kubeflow** | End-to-end ML platform | Comprehensive, powerful | Complex, steep learning curve |
-
-**Choice**: **MLflow** (free, simple, good integration with everything)
-
-#### Monitoring & Alerting
-
-| Tool | Purpose | Pros | Cons |
-|------|---------|------|------|
-| **Prometheus** | Metrics collection | Industry standard, reliable | Not real-time dashboards |
-| **Grafana** | Visualization & dashboards | Beautiful, flexible | Manual setup |
-| **DataDog** | Monitoring + APM | Full-stack, easy setup | Expensive at scale |
-| **ELK Stack** | Logs + visualization | Open-source, comprehensive | Operational burden |
-
-**Choice**: **Prometheus** + **Grafana** (open-source, reliable)
-
-#### Orchestration
-
-| Tool | Purpose | Pros | Cons |
-|------|---------|------|------|
-| **Apache Airflow** | Workflow orchestration | Flexible, good for ML | Python-centric |
-| **Prefect** | Modern workflow tool | Better UX than Airflow | Smaller community |
-| **Dagster** | Data orchestration | Great for data pipelines | Newer, less adoption |
-
-**Choice**: **Airflow** (industry standard for ML pipelines)
+This comprehensive toolkit covers the full ML system pipeline!
 
 ---
 
