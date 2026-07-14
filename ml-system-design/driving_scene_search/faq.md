@@ -24,6 +24,7 @@ This is a **living FAQ** for [design.md](design.md) / [solution.md](solution.md)
 | 6 | 2026-07-13 | In batch-based contrastive learning, how do we prevent true positives from being treated as negatives? What if two captions match the same video? | `[ANSWERED]` | Math / Architecture | [solution.md](solution.md) Step 4A |
 | 7 | 2026-07-13 | What exactly are "image tokens" or "video tokens"? I understand text tokens, but image/video tokens are confusing — aren't images just RGB pixels? | `[ANSWERED]` | Terminology | [solution.md](solution.md) Step 4A |
 | 8 | 2026-07-13 | In Step 4C long-tail mining, the seed-based approach assumes you know what to look for. What about automatically finding rare scenarios via clustering or other unsupervised methods? | `[ANSWERED]` | Architecture | [solution.md](solution.md) Step 4C |
+| 9 | 2026-07-13 | What is a BEV map? The solution mentions using LiDAR as a BEV representation, but what does that actually look like? | `[ANSWERED]` | Terminology | [solution.md](solution.md) Step 4A |
 
 *(Append new rows as questions come in.)*
 
@@ -672,6 +673,202 @@ The term "token" in vision is basically a historical accident — when Dosovitsk
 **TL;DR:** Image tokens are **patches of pixels embedded as dense vectors,** not discrete symbols. They're called "tokens" because they're fed to Transformers as a sequence, just like text tokens, but they're fundamentally different data types (768-D floats vs. integers). Vision researchers use the word "token" loosely; what matters is that they're fixed-size sequence elements the Transformer can process.
 
 *Pointer:* [solution.md](solution.md), Step 4A "Multimodal Video/Text Embeddings" — Video Tower; [[ViT vs CNN encoder question above]].
+
+---
+
+### Q: What is a BEV map? The solution mentions using LiDAR as a BEV representation — what does that actually look like? `[ANSWERED]`
+
+**A:**
+
+**BEV = Bird's Eye View** — a top-down (overhead) representation of the 3D scene, as if you're looking down at the road from directly above. Instead of the camera's eye-level perspective (which makes depth, occlusion, and perspective distortion confusing), BEV flattens the world into a 2D grid where spatial relationships are clear and natural.
+
+**From camera perspective (eye-level) to BEV:**
+
+```
+Eye-level camera view (confusing):
+┌──────────────────────────┐
+│   road stretches         │
+│   into the distance      │
+│   (perspective!)         │
+│                          │
+│  [car] [ped]            │
+│      [bike]             │
+└──────────────────────────┘
+     (hard to judge: how far away is each agent?
+      how much room between them? perspective distortion)
+
+Bird's Eye View (clear):
+      Ego vehicle (looking down)
+             ▼
+        ┌──────────┐
+        │          │
+     ▲  │          │  ▼
+  [cyclist]        [car]
+     │  │          │
+    ───┌──────────┐───
+        │          │
+        │  [ego]   │
+        │          │
+        └──────────┘
+        
+(overhead: exact distances, orientations, relationships are obvious)
+```
+
+**How BEV is constructed:**
+
+A BEV map is a **2D grid** where each cell represents a physical meter (or decimeter) of space in the real world:
+
+```python
+# Example BEV construction from LiDAR
+lidar_points = load_lidar_pointcloud()  # shape: (N_points, 3) — X, Y, Z coordinates
+
+# Discretize 3D points into a 2D grid
+# Grid dimensions: -50m to +150m forward (X), -50m to +50m sideways (Y)
+# Grid resolution: 0.1 meters per pixel
+
+grid_shape = (2000, 1000)  # 200m × 100m region at 0.1m/pixel
+bev_map = np.zeros(grid_shape, dtype=np.float32)
+
+# For each LiDAR point, find its grid cell and mark it
+for x, y, z in lidar_points:
+    # Convert world coordinates to grid indices
+    grid_x = int((x + 50) / 0.1)     # 50m back to grid origin
+    grid_y = int((y + 50) / 0.1)
+    
+    if 0 <= grid_x < 2000 and 0 <= grid_y < 1000:
+        # Occupancy: just mark as "something is here"
+        bev_map[grid_x, grid_y] = 1.0
+        
+        # Or intensity: use LiDAR reflectivity as the value
+        bev_map[grid_x, grid_y] = lidar_reflectivity(x, y, z)
+
+# Result: bev_map is a 2D image (2000 × 1000)
+# where each pixel's brightness = occupancy / reflectivity at that location
+```
+
+**Common variations:**
+
+1. **Occupancy grid** — binary (occupied or not):
+```
+BEV Occupancy Map:
+        0m                    100m (forward)
+      ┌────────────────────────┐
+ -50m │░░░░░░░░░░░░░░░░░░░░░░│
+      │░░░░░█████░░░░░░░░░░░░│ ← road edge
+    0m│░░░░░█████░░░░░░░░░░░░│
+      │░░░░░█████░░░░░░░░░░░░│ ← ego vehicle footprint
+      │░░░░░█████░░░░░░░░░░░░│
+ +50m │░░░░░░░░░░░░░░░░░░░░░░│
+      └────────────────────────┘
+      
+(█ = occupied, ░ = free space)
+```
+
+2. **Reflectivity/intensity grid** — LiDAR reflectivity (how shiny the surface is):
+```
+BEV Intensity Map:
+(darkness = no return / soft material; brightness = strong return / hard material)
+
+        0m                    100m
+      ┌────────────────────────┐
+ -50m │░░░░░░░░░░░░░░░░░░░░░░│
+      │░░░░░███████░░░░░░░░░░│ ← asphalt road
+    0m│░░░░░███████░░░░░░░░░░│    (medium reflectivity)
+      │░░░░░██████░░░░░░░░░░│
+      │░░░░░████████░░░░░░░░░│
+ +50m │░░░░░░░░░░░░░░░░░░░░░░│
+      └────────────────────────┘
+```
+
+3. **Height grid** — the maximum Z-value (height) at each location:
+```
+Useful for detecting obstacles vs. ground:
+- Road ground: height ≈ 0m
+- Curb: height ≈ 0.2m
+- Car: height ≈ 1.5m
+- Tree: height ≈ 5m+
+```
+
+**Why BEV is useful for autonomous driving:**
+
+1. **Natural coordinate frame** — vehicles naturally reason in forward/sideways coordinates; BEV aligns with this.
+2. **No perspective distortion** — distances are faithful to reality (a meter at 10m away looks the same as a meter at 100m away in BEV, unlike eye-level camera view).
+3. **Geometry-natural** — lane boundaries, obstacles, and relative positions are geometrically obvious.
+4. **Fuses multi-sensor data** — LiDAR points, radar returns, and camera detections can all be projected into the same BEV grid, which is hard to do in eye-level camera view.
+5. **Efficient for planning** — planners naturally work in 2D bird's-eye-view (top-down path planning) rather than 3D.
+
+**BEV in this system (Step 4A):**
+
+The solution mentions encoding LiDAR as a BEV occupancy/intensity map and fusing it with video embeddings:
+
+```
+Raw LiDAR points (X, Y, Z, reflectivity)
+                ▼
+        Create BEV grid (200m × 100m at 0.1m/pixel)
+                ▼
+        BEV Occupancy Map (2000 × 1000 2D image)
+                ▼
+        Small CNN encoder (e.g., ResNet-18)
+                ▼
+        BEV Embedding (e.g., 256-D vector)
+                ▼
+        Concatenate with video embedding (512-D)
+                ▼
+        Fused representation (768-D)
+                ▼
+        Project to shared embedding space (512-D)
+
+Why fuse LiDAR BEV with video?
+- Video (RGB) captures appearance: "is it a pedestrian or a cyclist?"
+- LiDAR BEV captures geometry: "what's the exact position and size of that object?"
+- Together: rich multi-modal representation that captures both semantic and geometric information
+- Example: "cyclist positioned left of lane" (geometry) + "cyclist on bike" (appearance)
+```
+
+**Concrete example: a clip with a cyclist and parked car**
+
+```
+Raw sensors:
+  Camera: RGB image showing cyclist + parked car
+  LiDAR: 3D point cloud of cyclist and car
+
+BEV Map (bird's eye view):
+        │
+     50m├────────────────────────────────
+        │  │
+        │  │ ·    (cyclist = a few points)
+        │  │ ·  ·
+     0m ├──┼──┼──────────────────────────── ← ego vehicle center
+        │  │ ■■■■■■■■ (car = dense cluster)
+        │  │ ■■■■■■■■
+    -50m├────────────────────────────────
+        │
+        └──┴────────────────────────
+         -50m  0m  50m  100m  150m
+                          (forward)
+
+Visualization:
+- · (dots) = sparse LiDAR returns from cyclist (less reflective)
+- ■ (blocks) = dense LiDAR returns from car (more reflective)
+- Positions are exactly as they appear from above (no perspective distortion)
+```
+
+**BEV resolution tradeoff:**
+
+- **High resolution** (e.g., 0.05m/pixel): captures fine detail (curbs, small obstacles), but more compute and memory.
+- **Low resolution** (e.g., 0.2m/pixel): coarse, but fast to compute.
+- **Typical for AVs:** 0.1m/pixel (10cm per grid cell) — a good tradeoff between precision and efficiency.
+
+**BEV in the context of multimodal embeddings (Step 4A):**
+
+The embedding model gets richer input by having both RGB (camera) and geometry (LiDAR BEV):
+- RGB alone might confuse a cyclist and a person standing with a long object.
+- BEV alone doesn't distinguish between objects.
+- Together: "cyclist in lane, positioned at (X, Y), moving forward" is far more specific and useful for the embedding space.
+
+This is especially important for the driving-scene search system, where you want to distinguish subtle scenarios like "cyclist swerving into lane" vs. "cyclist riding straight in the bike lane" — the camera alone might look similar, but LiDAR BEV shows the trajectory/lateral position clearly.
+
+*Pointer:* [solution.md](solution.md), Step 4A "Multimodal Video/Text Embeddings" — Multimodal fusion beyond RGB video.
 
 ---
 
