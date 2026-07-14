@@ -356,6 +356,360 @@ model.fit(X_train_resampled, y_train_resampled)
 model.evaluate(X_test, y_test)  # Evaluated on real distribution
 ```
 
+---
+
+### Q: When we oversample/undersample, don't the predicted probabilities become miscalibrated? How do we correct for this?
+
+**Answer:**
+
+You're absolutely correct! This is a **critical and often-overlooked problem**.
+
+#### The Problem
+
+```
+Original data:     99.9% legitimate, 0.1% fraud
+Training data:     50% legitimate, 50% fraud (after oversampling)
+
+What happens:
+- Model learns: "When I see fraud-like features, probability should be ~50%"
+- In production: Fraud-like features appear in 0.1% of cases
+- Model predicts: "This looks fraudy, 50% probability"
+- Reality: It's actually only 0.1% fraud in this population
+
+Decision threshold = 0.5 means:
+- Block if P(fraud) > 0.5
+- But in production, most predictions will be < 0.2 (calibrated to imbalanced reality)
+- Threshold is way too high!
+```
+
+#### Why This Happens
+
+The model learns **class priors** (baseline probability) from training data:
+
+```python
+# Original imbalanced training data
+P(fraud) = 100 / 1,000,000 = 0.1%  # Prior
+P(legitimate) = 999,900 / 1,000,000 = 99.9%
+
+# After oversampling to 50:50
+P(fraud) = 500 / 1,000 = 50%  # Model learns this!
+P(legitimate) = 500 / 1,000 = 50%
+
+# Model's predicted probabilities are based on 50:50 prior
+# But production data has 0.1:99.9 prior
+# Probabilities are completely miscalibrated!
+```
+
+---
+
+#### Solution 1: Use Class Weights Instead (No Resampling) ⭐ **BEST**
+
+**Best approach**: Avoid resampling entirely, use class weights only.
+
+```python
+# DON'T oversample/undersample
+# DO use class weights
+
+# Original imbalanced data (0.1% fraud)
+X_train, y_train  # Keep original distribution!
+
+# Compute class weights
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=[0, 1],
+    y=y_train
+)
+# class_weights = [0.5, 500]
+# Fraud weight: 500x (reflects rarity)
+
+# Train with weights (data distribution unchanged)
+model = xgb.XGBClassifier(scale_pos_weight=500)
+model.fit(X_train, y_train)
+
+# Predicted probabilities are now calibrated!
+# P(fraud) ≈ 0.001 (0.1%) for normal transactions
+# P(fraud) ≈ 0.5 for fraudy transactions
+```
+
+**Why this works**:
+- Model never sees artificially balanced data
+- Class weights tell model to focus on fraud without changing data distribution
+- Predicted probabilities reflect true population probabilities
+
+---
+
+#### Solution 2: Post-Hoc Probability Calibration
+
+If you already did resampling, you need to **recalibrate** the predictions:
+
+**Method 1: Platt Scaling (Logistic Calibration)**
+
+```python
+from sklearn.calibration import CalibratedClassifierCV
+
+# Train on resampled data
+X_train_resampled, y_train_resampled = oversample(X_train, y_train)
+model = xgb.XGBClassifier()
+model.fit(X_train_resampled, y_train_resampled)
+
+# Get predictions on original (imbalanced) validation set
+y_proba_uncalibrated = model.predict_proba(X_val)  # Miscalibrated!
+
+# Calibrate using original validation set
+calibrator = CalibratedClassifierCV(model, method='sigmoid', cv=5)
+calibrator.fit(X_val, y_val)  # Fit on original distribution!
+
+# Now predictions are calibrated
+y_proba_calibrated = calibrator.predict_proba(X_test)
+```
+
+**What it does**:
+- Learns a mapping from miscalibrated → calibrated probabilities
+- Uses Platt scaling: applies logistic function to uncalibrated scores
+- Example: 0.7 (from resampled model) → 0.15 (true probability)
+
+```python
+# Example calibration
+def platt_scaling(score):
+    # Learned parameters from validation set
+    a, b = 0.5, -2.0  # Example parameters
+    return 1 / (1 + np.exp(a * score + b))
+
+uncalibrated_score = 0.7  # Model prediction on resampled data
+calibrated_prob = platt_scaling(uncalibrated_score)  # ≈ 0.15 (true prob)
+```
+
+**Method 2: Isotonic Regression**
+
+```python
+from sklearn.calibration import IsotonicRegression
+
+# Train on resampled data
+model = xgb.XGBClassifier()
+model.fit(X_train_resampled, y_train_resampled)
+
+# Get predictions on original validation set
+y_proba_uncalibrated = model.predict_proba(X_val)[:, 1]
+
+# Fit isotonic regression on original distribution
+iso_reg = IsotonicRegression(out_of_bounds='clip')
+iso_reg.fit(y_proba_uncalibrated, y_val)
+
+# Calibrate test predictions
+y_proba_calibrated = iso_reg.predict(model.predict_proba(X_test)[:, 1])
+```
+
+**Pros/Cons**:
+- Isotonic: More flexible, better for non-linear calibration
+- Platt: Simpler, works well in practice
+
+---
+
+#### Solution 3: Adjust Threshold Post-Training
+
+If you can't recalibrate, at least adjust the decision threshold:
+
+```python
+# Resampled model predictions on original test set
+y_proba_uncalibrated = model.predict_proba(X_test)[:, 1]
+
+# These probabilities are miscalibrated
+# E.g., most legitimate are ~0.3, most fraud are ~0.7
+# But true priors are 0.1% fraud, 99.9% legit
+
+# Instead of threshold = 0.5, find optimal threshold
+from sklearn.metrics import precision_recall_curve
+
+precision, recall, thresholds = precision_recall_curve(y_test, y_proba_uncalibrated)
+
+# Find threshold for 95% recall (catch 95% of fraud)
+idx = np.argmax(recall >= 0.95)
+optimal_threshold = thresholds[idx]
+# optimal_threshold ≈ 0.3 (not 0.5!)
+
+# Use optimal threshold
+y_pred = (y_proba_uncalibrated > optimal_threshold).astype(int)
+```
+
+---
+
+#### Solution 4: Understand the Math (Bayes Rule)
+
+This is the most rigorous approach. Model outputs likelihood ratio, not probability:
+
+```
+Model predicts: P(features | fraud) / P(features | legitimate)
+This is a LIKELIHOOD RATIO, not probability!
+
+To get true probability:
+P(fraud | features) = P(features | fraud) * P(fraud) / P(features)
+
+Where P(fraud) is the TRUE prior (0.1% in production)
+
+Example:
+- Model confidence: 0.9 (learned on 50:50 data)
+- But this is likelihood ratio 9:1
+- Apply true prior (0.1%):
+- True probability = (9 * 0.001) / (9 * 0.001 + 1 * 0.999)
+                   = 0.009 / 1.008 ≈ 0.9%
+```
+
+**Implementation**:
+
+```python
+def calibrate_probability_with_true_prior(
+    model_prob,
+    true_prior_fraud=0.001,  # 0.1% fraud in production
+):
+    """
+    Convert model probability (trained on resampled data)
+    to true probability using Bayes rule.
+    
+    model_prob: probability from resampled model
+    true_prior_fraud: true fraud rate in production
+    """
+    # Likelihood ratio
+    odds_ratio = model_prob / (1 - model_prob)
+    
+    # Prior odds (true distribution)
+    prior_odds = true_prior_fraud / (1 - true_prior_fraud)
+    
+    # Posterior odds
+    posterior_odds = odds_ratio * prior_odds
+    
+    # Convert back to probability
+    true_probability = posterior_odds / (1 + posterior_odds)
+    
+    return true_probability
+
+# Example
+model_prob = 0.7  # Model says 70% fraud (trained on 50:50)
+true_prob = calibrate_probability_with_true_prior(
+    model_prob,
+    true_prior_fraud=0.001
+)
+print(f"Model: {model_prob}, True: {true_prob:.4f}")
+# Output: Model: 0.7, True: 0.0009 (0.09%)
+```
+
+---
+
+#### Comparison of Solutions
+
+| Solution | Effort | Accuracy | When to Use |
+|----------|--------|----------|------------|
+| **Use class weights instead** | Low | Perfect | Before training (best) |
+| **Platt scaling** | Medium | Good | Post-training, simple calibration |
+| **Isotonic regression** | Medium | Very Good | Post-training, complex data |
+| **Threshold tuning** | Low | Fair | Quick fix, imperfect |
+| **Bayes rule calibration** | Medium | Perfect | Understand true prior well |
+
+---
+
+#### Practical Example: Fraud Detection
+
+```python
+import numpy as np
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score
+
+# Step 1: Original imbalanced training data
+X_train = ...  # Features
+y_train = ...  # 0.1% fraud, 99.9% legitimate
+
+# Step 2: Oversample for training
+from imblearn.over_sampling import SMOTE
+smote = SMOTE(sampling_strategy=0.3)
+X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+# Now 30% fraud, 70% legitimate (NOT representative!)
+
+# Step 3: Train model on resampled data
+model = xgb.XGBClassifier()
+model.fit(X_train_resampled, y_train_resampled)
+
+# Step 4: Evaluate on ORIGINAL (imbalanced) validation set
+y_proba_uncalibrated = model.predict_proba(X_val)[:, 1]
+auc_uncalibrated = roc_auc_score(y_val, y_proba_uncalibrated)
+print(f"AUC before calibration: {auc_uncalibrated}")  # Good AUC
+
+# Problem: Predicted probabilities are miscalibrated
+predicted_fraud_rate = y_proba_uncalibrated.mean()
+actual_fraud_rate = y_val.mean()
+print(f"Predicted rate: {predicted_fraud_rate:.1%}, Actual: {actual_fraud_rate:.1%}")
+# Output: Predicted rate: 30.0%, Actual: 0.1% (WAY OFF!)
+
+# Step 5: Calibrate
+calibrator = CalibratedClassifierCV(model, method='sigmoid', cv=5)
+calibrator.fit(X_val, y_val)  # Use original distribution!
+
+# Step 6: Get calibrated probabilities
+y_proba_calibrated = calibrator.predict_proba(X_test)[:, 1]
+
+# Now probabilities match reality
+predicted_fraud_rate_cal = y_proba_calibrated.mean()
+actual_fraud_rate_test = y_test.mean()
+print(f"After calibration - Predicted: {predicted_fraud_rate_cal:.1%}, Actual: {actual_fraud_rate_test:.1%}")
+# Output: After calibration - Predicted: 0.1%, Actual: 0.1% (MATCHED!)
+```
+
+---
+
+#### Key Takeaways
+
+1. **Oversampling/undersampling break probability calibration** — this is not a minor detail!
+
+2. **Best solution: Use class weights instead**
+   - No resampling = no miscalibration
+   - Probabilities are automatically correct
+   - Recommended for fraud detection
+
+3. **If you must resample: Calibrate afterwards**
+   - Platt scaling: Simple, good
+   - Isotonic regression: Flexible, very good
+   - Bayes rule: Perfect if you know true prior
+
+4. **Always evaluate on original distribution**
+   - Test set should reflect production reality (0.1% fraud)
+   - Not balanced 50:50
+   - This reveals miscalibration
+
+5. **Monitor predicted vs actual fraud rate**
+   ```python
+   predicted_rate = y_proba.mean()
+   actual_rate = y_true.mean()
+   assert abs(predicted_rate - actual_rate) < 0.01  # Should be close!
+   ```
+
+6. **Threshold adjustment is not enough**
+   - Changing threshold doesn't fix miscalibration
+   - You need probability calibration
+
+---
+
+#### Recommended Approach for Fraud Detection
+
+```python
+# BEST PRACTICE
+# 1. Don't oversample
+# 2. Use class weights only
+# 3. Probabilities are automatically calibrated
+
+X_train, y_train = load_imbalanced_data()  # 0.1% fraud
+
+# Train with class weights (no resampling)
+class_weight = {
+    0: 1.0,
+    1: len(y_train[y_train==0]) / len(y_train[y_train==1])  # ~1000
+}
+
+model = xgb.XGBClassifier(scale_pos_weight=class_weight[1])
+model.fit(X_train, y_train)
+
+# Predicted probabilities are now calibrated to true distribution
+# P(fraud | features) ≈ 0.001 for normal transactions
+# P(fraud | features) ≈ 0.5+ for fraudy transactions
+```
+
 #### Inconsistencies
 - **Identify**:
   - **Format inconsistencies**: Date formats, currency, units
