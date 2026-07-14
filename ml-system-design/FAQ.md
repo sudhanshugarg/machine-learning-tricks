@@ -16,6 +16,7 @@ This FAQ addresses common questions across ML system design problems. These are 
 
 ### 2. Data Processing & Feature Engineering
 - [2.1 Scalable Data Processing Pipelines](#21-scalable-data-processing-pipelines)
+- [2.2 Domain-Specific Feature Engineering](#22-domain-specific-feature-engineering)
 
 ### 3. Data Versioning & Management
 - [3.1 Importance of Data Versioning](#31-importance-of-data-versioning)
@@ -1681,7 +1682,610 @@ def validate_features(features_df):
 
 ---
 
-## 3. Data Versioning & Management
+## 2. Data Processing & Feature Engineering
+
+### 2.2 Domain-Specific Feature Engineering
+
+**Q: What are effective feature engineering techniques for different ML domains?**
+
+**Answer:**
+
+Feature engineering is domain-specific. The best features depend heavily on the problem. Let me show three real-world examples:
+
+---
+
+## Domain 1: Fraud Detection
+
+### Understanding the Domain
+
+Fraudsters exploit patterns that differ from legitimate users:
+- Unusual velocity (many transactions in short time)
+- Inconsistent locations (geographically impossible jumps)
+- New devices/accounts
+- Untypical merchants
+
+### Domain Expertise Features (Hand-Crafted)
+
+These come from understanding fraud patterns:
+
+```python
+import pandas as pd
+import numpy as np
+from datetime import timedelta
+
+def create_fraud_detection_features(df):
+    """Create hand-crafted features for fraud detection"""
+    
+    # 1. VELOCITY FEATURES (temporal patterns)
+    # Count transactions in time windows
+    df['txn_1h'] = df.groupby('user_id')['timestamp'].apply(
+        lambda x: x.rolling('1h').count()
+    )
+    df['txn_24h'] = df.groupby('user_id')['timestamp'].apply(
+        lambda x: x.rolling('24h').count()
+    )
+    df['amount_1h'] = df.groupby('user_id')['amount'].apply(
+        lambda x: x.rolling('1h').sum()
+    )
+    
+    # 2. LOCATION CONSISTENCY (geographic patterns)
+    # Distance from last transaction location
+    df['location_distance'] = df.groupby('user_id').apply(
+        lambda grp: haversine_distance(
+            grp['latitude'].shift(1),
+            grp['longitude'].shift(1),
+            grp['latitude'],
+            grp['longitude']
+        )
+    )
+    
+    # Time since last transaction
+    df['time_since_last_txn'] = df.groupby('user_id')['timestamp'].diff()
+    
+    # Physically impossible travel
+    # (distance / time > speed of aircraft = 900 mph)
+    df['impossible_travel'] = (
+        (df['location_distance'] / 1.609) / 
+        (df['time_since_last_txn'].dt.total_seconds() / 3600)
+    ) > 900
+    
+    # 3. DEVICE CONSISTENCY
+    # Is this device new for this user?
+    df['device_is_new'] = df.groupby('user_id')['device_id'].apply(
+        lambda x: x != x.shift(1)
+    )
+    
+    # Number of devices per user
+    df['num_devices'] = df.groupby('user_id')['device_id'].transform('nunique')
+    
+    # 4. MERCHANT PATTERNS
+    # Is this a typical merchant for this user?
+    typical_merchants = df.groupby('user_id')['merchant_id'].apply(
+        lambda x: x.value_counts().head(5).index.tolist()
+    )
+    df['merchant_is_typical'] = df.apply(
+        lambda row: row['merchant_id'] in typical_merchants.get(row['user_id'], []),
+        axis=1
+    )
+    
+    # Transaction category consistency
+    df['category_is_typical'] = df.groupby('user_id')['merchant_category'].apply(
+        lambda x: x == x.mode()[0]
+    )
+    
+    # 5. ACCOUNT BEHAVIOR
+    # Average transaction amount (users have spending patterns)
+    df['amount_vs_avg'] = df.groupby('user_id')['amount'].transform(
+        lambda x: df['amount'] / x.mean()
+    )
+    
+    # Std deviation of amounts (fraud often has high variance)
+    df['amount_std_vs_mean'] = df.groupby('user_id')['amount'].transform(
+        lambda x: x.std() / x.mean() if x.mean() > 0 else 0
+    )
+    
+    # Time of day patterns (users have habits)
+    df['hour_of_day'] = df['timestamp'].dt.hour
+    df['day_of_week'] = df['timestamp'].dt.dayofweek
+    df['is_weekend'] = df['day_of_week'] >= 5
+    
+    # 6. NETWORK FEATURES (if available)
+    # Is user in a known fraud ring? (users connected to fraudsters)
+    df['connected_to_fraud'] = df['user_id'].isin(fraud_ring_users)
+    
+    return df
+```
+
+### Automated Feature Generation Methods
+
+Automated techniques that learn features from data:
+
+```python
+from sklearn.preprocessing import PolynomialFeatures
+import category_encoders as ce
+
+def create_automated_features(df):
+    """Automatically generate features"""
+    
+    # 1. POLYNOMIAL FEATURES
+    # Create interaction terms (e.g., amount * velocity)
+    poly = PolynomialFeatures(degree=2, include_bias=False)
+    
+    feature_cols = ['amount', 'txn_24h', 'device_age_days']
+    X_poly = poly.fit_transform(df[feature_cols])
+    
+    # Creates: amount^2, amount*txn_24h, amount*device_age, etc.
+    feature_names = poly.get_feature_names_out(feature_cols)
+    df_poly = pd.DataFrame(X_poly, columns=feature_names)
+    
+    # 2. EMBEDDING-BASED FEATURES (from categorical data)
+    # Learn dense representations of merchants, devices
+    encoder = ce.TargetEncoder(cols=['merchant_id', 'device_id'])
+    df['merchant_encoded'] = encoder.fit_transform(df['merchant_id'], df['is_fraud'])
+    df['device_encoded'] = encoder.fit_transform(df['device_id'], df['is_fraud'])
+    
+    # 3. STATISTICAL AGGREGATES
+    # Automatically compute stats for each user
+    agg_features = df.groupby('user_id').agg({
+        'amount': ['min', 'max', 'median', 'std', 'skew', 'kurtosis'],
+        'transaction_id': 'count',
+        'merchant_id': 'nunique',
+    })
+    
+    # 4. BINNING/DISCRETIZATION
+    # Convert continuous to categorical (model can learn non-linear)
+    df['amount_bin'] = pd.qcut(df['amount'], q=5, labels=['very_low', 'low', 'medium', 'high', 'very_high'])
+    
+    return df
+```
+
+### Feature Selection for Fraud Detection
+
+```python
+from sklearn.feature_selection import mutual_info_classif, SelectKBest
+
+def select_best_features(X, y, k=20):
+    """Select most informative features"""
+    
+    # Mutual information: how much knowing feature X reduces uncertainty in y?
+    scores = mutual_info_classif(X, y)
+    
+    # Select top-k features
+    selector = SelectKBest(score_func=mutual_info_classif, k=k)
+    X_selected = selector.fit_transform(X, y)
+    
+    selected_features = X.columns[selector.get_support()].tolist()
+    return X_selected, selected_features
+```
+
+**Fraud Detection Features Summary**:
+```
+Domain Expertise: velocity, location, device consistency, merchant patterns
+Automated: polynomial features, embeddings, statistical aggregates, binning
+Sweet Spot: 70% domain expertise + 30% automated
+```
+
+---
+
+## Domain 2: Recommender & Ranking Systems
+
+### Understanding the Domain
+
+Users have preferences based on:
+- Item properties (genre, price, category)
+- User history (what they've consumed before)
+- Context (time, season, location)
+- Social signals (what friends like)
+- Popularity (trending items)
+
+### Domain Expertise Features (Hand-Crafted)
+
+```python
+def create_recommendation_features(user_df, item_df, interaction_df):
+    """Create features for recommendation system"""
+    
+    # 1. USER FEATURES
+    # What genre does this user prefer?
+    user_genre_pref = interaction_df.groupby('user_id').apply(
+        lambda x: x['genre'].value_counts().to_dict()
+    )
+    user_df['favorite_genre'] = user_df['user_id'].map(user_genre_pref)
+    
+    # How much does user typically rate items?
+    user_df['avg_rating'] = interaction_df.groupby('user_id')['rating'].mean()
+    
+    # User engagement (how many items rated?)
+    user_df['num_rated'] = interaction_df.groupby('user_id').size()
+    
+    # Recency: how active is user? (time since last interaction)
+    user_df['days_since_last_interaction'] = (
+        pd.Timestamp.now() - 
+        interaction_df.groupby('user_id')['timestamp'].max()
+    ).dt.days
+    
+    # 2. ITEM FEATURES
+    # Item popularity (how many users rated it?)
+    item_df['popularity'] = interaction_df.groupby('item_id').size()
+    
+    # Item quality (average rating)
+    item_df['avg_rating'] = interaction_df.groupby('item_id')['rating'].mean()
+    
+    # Item novelty (when was it released?)
+    item_df['days_since_release'] = (
+        pd.Timestamp.now() - item_df['release_date']
+    ).dt.days
+    
+    # 3. INTERACTION FEATURES (user-item specific)
+    # Similarity: how similar is item to user's past items?
+    # (compare genres, actors, directors, etc.)
+    interaction_df['genre_similarity'] = interaction_df.apply(
+        lambda row: compute_set_similarity(
+            user_df.loc[row['user_id'], 'favorite_genre'].keys(),
+            item_df.loc[row['item_id'], 'genres']
+        ),
+        axis=1
+    )
+    
+    # Collaborative filtering score
+    # (users similar to this user like this item?)
+    interaction_df['collab_score'] = interaction_df.apply(
+        lambda row: compute_collab_filtering_score(
+            row['user_id'],
+            row['item_id'],
+            interaction_df
+        ),
+        axis=1
+    )
+    
+    # 4. CONTEXT FEATURES
+    # Time of day/week patterns (what do users watch when?)
+    interaction_df['hour'] = interaction_df['timestamp'].dt.hour
+    interaction_df['day_of_week'] = interaction_df['timestamp'].dt.dayofweek
+    interaction_df['is_weekend'] = interaction_df['day_of_week'] >= 5
+    
+    # Seasonality (movies popular in winter vs summer?)
+    interaction_df['month'] = interaction_df['timestamp'].dt.month
+    
+    # 5. SOCIAL FEATURES (if available)
+    # Friends' preferences
+    interaction_df['friend_likes'] = interaction_df.apply(
+        lambda row: count_friends_who_rated_item(
+            row['user_id'],
+            row['item_id'],
+            social_graph
+        ),
+        axis=1
+    )
+    
+    return user_df, item_df, interaction_df
+```
+
+### Automated Feature Generation
+
+```python
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import StandardScaler
+
+def create_embeddings_for_recommendations(interaction_matrix):
+    """Learn latent factors via matrix factorization"""
+    
+    # Construct user-item interaction matrix
+    # Rows: users, Columns: items, Values: ratings
+    
+    # SVD: Learn low-rank approximation
+    # Discovers latent factors (e.g., "action vs drama", "popularity")
+    svd = TruncatedSVD(n_components=50, random_state=42)
+    user_embeddings = svd.fit_transform(interaction_matrix)
+    item_embeddings = svd.components_.T
+    
+    # user_embeddings: (n_users, 50) - latent representation of each user
+    # item_embeddings: (n_items, 50) - latent representation of each item
+    
+    # Recommendation score = dot product of embeddings
+    # score(user, item) = user_embedding · item_embedding
+    
+    return user_embeddings, item_embeddings
+
+# Neural network can learn better embeddings
+import tensorflow as tf
+
+def neural_collaborative_filtering(user_ids, item_ids, ratings):
+    """Learn embeddings with neural network"""
+    
+    user_input = tf.keras.Input(shape=(1,), name='user_input')
+    item_input = tf.keras.Input(shape=(1,), name='item_input')
+    
+    # Embed users and items to dense vectors
+    user_embed = tf.keras.layers.Embedding(n_users, embedding_dim)(user_input)
+    item_embed = tf.keras.layers.Embedding(n_items, embedding_dim)(item_input)
+    
+    # Concatenate and pass through neural network
+    concat = tf.keras.layers.Concatenate()([
+        tf.keras.layers.Flatten()(user_embed),
+        tf.keras.layers.Flatten()(item_embed)
+    ])
+    
+    dense1 = tf.keras.layers.Dense(128, activation='relu')(concat)
+    dense2 = tf.keras.layers.Dense(64, activation='relu')(dense1)
+    
+    # Output: predicted rating
+    output = tf.keras.layers.Dense(1, activation='sigmoid')(dense2)
+    
+    model = tf.keras.Model(inputs=[user_input, item_input], outputs=output)
+    model.compile(optimizer='adam', loss='mse')
+    model.fit([user_ids, item_ids], ratings, epochs=10)
+    
+    return model
+```
+
+**Recommendation Features Summary**:
+```
+Domain Expertise: user preferences, item properties, context, social
+Automated: embeddings (SVD, neural networks), matrix factorization
+Sweet Spot: 60% domain expertise + 40% automated (embeddings learn latent factors)
+```
+
+---
+
+## Domain 3: Video Search & Retrieval
+
+### Understanding the Domain
+
+Users search for videos based on:
+- Content (what's in the video - scene analysis)
+- Metadata (title, description, tags)
+- Temporal patterns (when video is relevant)
+- Multimodal signals (video frames, audio, text)
+- User intent (what they're searching for)
+
+### Domain Expertise Features (Hand-Crafted)
+
+```python
+def create_video_search_features(video_df, query_df, click_log_df):
+    """Create features for video search ranking"""
+    
+    # 1. VIDEO METADATA FEATURES
+    video_df['title_length'] = video_df['title'].str.len()
+    video_df['description_length'] = video_df['description'].str.len()
+    video_df['num_tags'] = video_df['tags'].apply(lambda x: len(x.split(',')))
+    
+    # Extract entities from video (people, locations, objects)
+    video_df['has_people'] = video_df['tags'].str.contains('person|people', regex=True)
+    video_df['has_action'] = video_df['tags'].str.contains('action|fight|chase', regex=True)
+    
+    # 2. TEMPORAL FEATURES
+    # How recent is the video? (newer videos ranked higher)
+    video_df['days_since_upload'] = (
+        pd.Timestamp.now() - video_df['upload_date']
+    ).dt.days
+    
+    # Video duration preference
+    video_df['duration_in_mins'] = video_df['duration_seconds'] / 60
+    
+    # 3. POPULARITY FEATURES
+    # View count (popularity signal)
+    video_df['log_view_count'] = np.log1p(video_df['view_count'])
+    
+    # Watch rate (what % of viewers watch to end?)
+    video_df['watch_rate'] = video_df['avg_watch_time'] / video_df['duration_seconds']
+    
+    # Engagement (likes/comments per view)
+    video_df['engagement_rate'] = (
+        (video_df['likes'] + video_df['comments']) / video_df['view_count']
+    )
+    
+    # 4. QUERY-VIDEO MATCHING FEATURES
+    # Text similarity: how similar is video title/desc to query?
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    
+    for idx, row in query_df.iterrows():
+        query = row['query']
+        video_df[f'title_similarity_q{idx}'] = video_df['title'].apply(
+            lambda x: compute_tfidf_similarity(query, x)
+        )
+        video_df[f'desc_similarity_q{idx}'] = video_df['description'].apply(
+            lambda x: compute_tfidf_similarity(query, x)
+        )
+    
+    # 5. CLICK HISTORY FEATURES (for ranking)
+    # Click-through rate: how often do users click this result for similar queries?
+    video_click_rates = click_log_df.groupby('video_id').apply(
+        lambda x: x['clicked'].sum() / len(x)
+    )
+    video_df['historical_ctr'] = video_df['video_id'].map(video_click_rates)
+    
+    # Dwell time: how long do users watch after clicking?
+    avg_dwell = click_log_df.groupby('video_id')['watch_time'].mean()
+    video_df['avg_dwell_time'] = video_df['video_id'].map(avg_dwell)
+    
+    return video_df
+```
+
+### Automated Feature Generation (Multimodal)
+
+```python
+import cv2
+from transformers import CLIPProcessor, CLIPModel
+
+def extract_visual_features(video_path):
+    """Extract features from video frames automatically"""
+    
+    # 1. CLIP EMBEDDINGS (image-text alignment)
+    # CLIP: learn joint embedding space for images and text
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    
+    # Sample frames from video
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    for i in range(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 30):  # Every 30th frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if ret:
+            frames.append(frame)
+    cap.release()
+    
+    # Get embeddings for frames
+    frame_embeddings = []
+    for frame in frames:
+        inputs = processor(images=frame, return_tensors="pt")
+        with torch.no_grad():
+            image_features = model.get_image_features(**inputs)
+        frame_embeddings.append(image_features)
+    
+    # Average frame embeddings
+    video_embedding = torch.stack(frame_embeddings).mean(dim=0)
+    return video_embedding
+
+def extract_audio_features(video_path):
+    """Extract audio features automatically"""
+    
+    import librosa
+    from transformers import Wav2Vec2Processor, Wav2Vec2Model
+    
+    # Load audio
+    y, sr = librosa.load(video_path)
+    
+    # Automatic speech recognition features
+    processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+    model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
+    
+    inputs = processor(y, sampling_rate=sr, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs)
+    
+    # audio_embeddings: (1, seq_len, 768)
+    audio_embedding = outputs.last_hidden_state.mean(dim=1)  # (1, 768)
+    
+    return audio_embedding
+
+def extract_text_features(transcript, title, description):
+    """Extract semantic features from text"""
+    
+    from transformers import AutoTokenizer, AutoModel
+    
+    # BERT embeddings for semantic understanding
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    model = AutoModel.from_pretrained("bert-base-uncased")
+    
+    # Combine all text
+    full_text = f"{title} {description} {transcript}"
+    
+    # Tokenize and encode
+    inputs = tokenizer(full_text, return_tensors="pt", truncation=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    
+    # CLS token = document embedding
+    text_embedding = outputs.last_hidden_state[:, 0, :]  # (1, 768)
+    
+    return text_embedding
+
+def create_multimodal_features(video_path, transcript, title, description):
+    """Combine visual, audio, and text features"""
+    
+    # Extract from each modality
+    visual_embedding = extract_visual_features(video_path)  # (1, 512)
+    audio_embedding = extract_audio_features(video_path)    # (1, 768)
+    text_embedding = extract_text_features(transcript, title, description)  # (1, 768)
+    
+    # Concatenate all modalities
+    multimodal_embedding = torch.cat([
+        visual_embedding,
+        audio_embedding,
+        text_embedding
+    ], dim=1)  # (1, 2048)
+    
+    # Optional: Learn projection to common space
+    projection = torch.nn.Linear(2048, 256)
+    fused_embedding = projection(multimodal_embedding)  # (1, 256)
+    
+    return fused_embedding
+```
+
+**Video Search Features Summary**:
+```
+Domain Expertise: metadata, temporal, popularity, query-matching
+Automated: multimodal embeddings (visual, audio, text), CLIP, transformers
+Sweet Spot: 40% domain expertise + 60% automated (videos are complex, need deep learning)
+```
+
+---
+
+## Feature Engineering Best Practices
+
+### Across All Domains:
+
+```python
+def build_production_features(df, domain='fraud'):
+    """
+    Production feature pipeline:
+    1. Domain expertise features (interpretable, stable)
+    2. Automated features (high capacity, may overfit)
+    3. Feature selection (keep top-k)
+    4. Feature scaling (normalize for neural networks)
+    """
+    
+    # Step 1: Domain expertise features
+    if domain == 'fraud':
+        df = create_fraud_detection_features(df)
+    elif domain == 'recommendation':
+        df = create_recommendation_features(df)
+    elif domain == 'video_search':
+        df = create_video_search_features(df)
+    
+    # Step 2: Automated features
+    df = create_automated_features(df)
+    
+    # Step 3: Feature selection (reduce dimensionality)
+    X = df.drop(columns=['label'])
+    y = df['label']
+    X_selected, selected_features = select_best_features(X, y, k=100)
+    
+    # Step 4: Scale features
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_selected)
+    
+    return X_scaled, selected_features, scaler
+```
+
+### Feature Engineering Checklist:
+
+```
+✓ Domain Expertise (70-80% of effort)
+  - Talk to domain experts (fraud analysts, product managers)
+  - Understand what patterns matter
+  - Create interpretable features
+  
+✓ Automated Methods (20-30% of effort)
+  - Embeddings / dimensionality reduction
+  - Polynomial features / interactions
+  - Statistical aggregates
+  
+✓ Feature Selection
+  - Mutual information / correlation
+  - Model-based importance
+  - Keep top-k features
+  
+✓ Avoid Common Mistakes
+  - Don't leak test data into features
+  - Don't scale before train/test split
+  - Don't use features that won't be available at inference
+  - Monitor feature importance over time
+```
+
+---
+
+## Summary: Domain-Specific Feature Engineering
+
+| Domain | Domain Expertise % | Automated % | Key Techniques |
+|--------|-------------------|------------|-----------------|
+| **Fraud Detection** | 70% | 30% | Velocity, location, device consistency, polynomial features |
+| **Recommendation** | 60% | 40% | User/item profiles, collaborative filtering, embeddings |
+| **Video Search** | 40% | 60% | Metadata, multimodal embeddings, CLIP, transformers |
+
+**Golden Rule**: "Start with domain expertise features (interpretable, stable). Add automated features for capacity. Let the data decide what matters."
 
 ### 3.1 Importance of Data Versioning
 
