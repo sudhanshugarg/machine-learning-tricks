@@ -111,6 +111,7 @@ Before considering a problem folder done:
 |-------|---------------------------|--------------|
 | `driving_scene_search/` | Yes | Semantic search/retrieval over AV driving video; multimodal embeddings, long-tail sampling, vector search at scale |
 | `post_incident_failure_attribution/` | Yes | Root-cause attribution (Perception/Prediction/Planning) after AV collisions/near-misses; anomaly detection, automated labeling, model observability |
+| `ml_experiment_tracking_platform/` | Yes | Internal experiment tracking/analysis platform (MLflow/W&B-style); client SDK write path, polyglot storage, run comparison, sweeps, reproducibility & model registry |
 | `ad-recommendation-system/` | No (legacy) | Ad ranking/recommendation for social media |
 | `recommendation_system/` | No (legacy) | General recommendation system design |
 | `chatgpt_clone/` | No (legacy) | Conversational LLM serving system |
@@ -121,4 +122,4 @@ Before considering a problem folder done:
 ---
 
 ## Last Updated
-2026-07-13
+2026-07-14
