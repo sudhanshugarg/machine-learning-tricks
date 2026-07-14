@@ -22,6 +22,7 @@ This is a **living FAQ** for [design.md](design.md) / [solution.md](solution.md)
 | 4 | 2026-07-13 | What is a ViT (Vision Transformer) encoder vs. a CNN encoder? How do they differ and which should I use? | `[ANSWERED]` | Terminology / Architecture | [solution.md](solution.md) Step 4A |
 | 5 | 2026-07-13 | What are "perception stack detections"? What information do they contain, and what do some concrete examples look like? | `[ANSWERED]` | Terminology | [solution.md](solution.md) Step 4A |
 | 6 | 2026-07-13 | In batch-based contrastive learning, how do we prevent true positives from being treated as negatives? What if two captions match the same video? | `[ANSWERED]` | Math / Architecture | [solution.md](solution.md) Step 4A |
+| 7 | 2026-07-13 | What exactly are "image tokens" or "video tokens"? I understand text tokens, but image/video tokens are confusing — aren't images just RGB pixels? | `[ANSWERED]` | Terminology | [solution.md](solution.md) Step 4A |
 
 *(Append new rows as questions come in.)*
 
@@ -530,6 +531,152 @@ The main answer: **design the dataset so each video pairs with one canonical cap
 *Pointer:* [solution.md](solution.md), Step 4A "Multimodal Video/Text Embeddings" — Architecture: Dual/Multi-Tower Contrastive Embedding; [[CLIP embedding question above]].
 
 ---
+
+### Q: What exactly are "image tokens" or "video tokens"? I understand text tokens, but vision tokens are confusing — aren't images just RGB pixels? `[ANSWERED]`
+
+**A:**
+
+Great question — this terminology is confusing because **vision "tokens" are fundamentally different from text tokens**, even though both are called "tokens."
+
+**Text tokens:** discrete, symbolic units
+```
+Text: "The cat is sleeping"
+Tokenize: ["The", "cat", "is", "sleeping"]
+Then embed: [token_id_1, token_id_2, token_id_3, token_id_4]
+           (e.g., [262, 1234, 318, 5678])
+Each token is an integer index into a fixed vocabulary (like a dictionary lookup).
+```
+
+**Image tokens:** NOT discrete — they're patches of pixels + their learned embeddings
+
+The confusion arises because vision researchers borrowed the word "token" from NLP, but it means something different:
+
+```
+Image: 224×224 RGB pixels (224 × 224 × 3 = 150,528 individual float values)
+                ▼
+Patch-ify: divide into non-overlapping 16×16 patches
+           224/16 = 14, so 14 × 14 = 196 patches
+                ▼
+Embed each patch: 
+  For each 16×16 patch (~768 RGB pixels):
+    - Flatten into a 1D vector: [R₁, G₁, B₁, R₂, G₂, B₂, ..., R₇₆₈, G₇₆₈, B₇₆₈]
+    - Pass through a LINEAR PROJECTION (a learnable weight matrix W):
+      token_embedding = W @ flattened_patch  
+      (e.g., W is 768×768, so you get a 768-D output from 768-D input)
+    - Result: one 768-D dense vector per patch (not an integer index!)
+
+Now you have 196 vectors (one per patch), each vector is 768 floats.
+These 196 vectors are what people call "image tokens" — but they're NOT
+discrete symbols (indices), they're DENSE VECTORS (embeddings).
+```
+
+**Why is it called "tokens" at all if it's not discrete?**
+
+Because the Transformer architecture (which powers modern ViT / CLIP models) is fundamentally a **sequence-to-sequence model**. It expects:
+- A sequence of **fixed-size inputs**
+- Each input can be anything (a discrete integer, a dense vector, etc.)
+
+Text Transformers use discrete token IDs because language is naturally discrete.
+Vision Transformers use patch embeddings (dense vectors) because images are naturally continuous.
+
+The word "token" in both cases just means *"one item in a sequence that will be fed to a Transformer,"* but:
+- Text token = integer ID (e.g., 262)
+- Vision token = dense vector (e.g., 768-D float vector)
+
+```
+               Text Domain              Vision Domain
+                   │                          │
+        "The cat is sleeping"         224×224 RGB image
+                   │                          │
+          Tokenize (discrete)       Patchify + embed (continuous)
+                   │                          │
+        [262, 1234, 318, 5678]      [token₁, token₂, ..., token₁₉₆]
+      (integers, indices)             (768-D vectors, each)
+                   │                          │
+        Lookup in embedding table    (already embedded, no lookup needed)
+                   │                          │
+        [emb₁, emb₂, emb₃, emb₄]   [token₁, token₂, ..., token₁₉₆]
+       (all 768-D vectors)            (already 768-D vectors)
+                   │                          │
+                   └──────────────────┬───────┘
+                                      ▼
+                          Feed to Transformer
+```
+
+**Concrete walkthrough: ViT encoding a 224×224 frame from a driving video**
+
+```python
+# Raw image: shape (3, 224, 224) — 3 color channels, 224×224 pixels
+image = load_frame('frame_001.png')  # shape: (3, 224, 224)
+
+# Step 1: Divide into 16×16 patches
+patch_size = 16
+num_patches_per_side = 224 / 16  # = 14
+num_patches_total = 14 * 14  # = 196 patches
+
+patches = image.unfold(1, 16, 16).unfold(2, 16, 16)
+# Result: shape (3, 14, 14, 16, 16) — a 14×14 grid of 16×16 patches
+# Reshape to (196, 768) — 196 patches, each flattened to 768 values (3 channels × 16 × 16)
+
+# Step 2: Project each patch to token embedding dimension (e.g., 768 → 768)
+W_proj = torch.randn(768, 768)  # learnable projection matrix
+patch_embeddings = (patches.reshape(196, -1)) @ W_proj  
+# Result: shape (196, 768) — 196 tokens, each a 768-D dense vector
+
+# These 196 vectors are the "image tokens" that get fed to the Transformer.
+
+# Transformer then does:
+# - Self-attention: each token attends over all 196 tokens
+# - Output: 196 refined token vectors (or a pooled [CLS] token for image classification)
+```
+
+**Video tokens (the sequence dimension extends to time):**
+
+When you have a video (a sequence of frames), the tokenization extends naturally:
+
+```
+1 frame:    14×14 patches = 196 spatial tokens
+10 frames:  14×14×10 = 1960 spatio-temporal tokens
+
+Each token still represents a small 3D cube of the video (16×16 pixels × a few frames 
+or 1 frame depending on how you factorize the temporal dimension), and each is still
+a 768-D embedding.
+
+A video Transformer (like ViViT) attends over all 1960 tokens at once, learning
+which spatial regions and which time frames matter for understanding the clip.
+```
+
+**Why patch embeddings instead of just feeding raw pixels?**
+
+1. **Dimensionality reduction:** 224×224×3 = 150K pixel values → 196×768 = 150K values (similar scale, but organized nicely).
+2. **Semantic grouping:** each token represents a small spatial region, which is closer to human visual intuition than individual pixels.
+3. **Inductive bias:** Transformers work best with sequences of 100–10K items; raw pixels would be too large. Patches are a natural level of granularity.
+4. **Computational efficiency:** Transformers scale as $O(n^2)$ in sequence length; working with 196 patches is far cheaper than 150K pixels.
+
+**Comparison table: tokens across modalities**
+
+| Modality | Raw input | Tokenization | Token type | Count per input |
+|---|---|---|---|---|
+| Text (NLP) | "cat is here" | split by spaces/subwords | **discrete integer** (vocabulary index) | ~10 |
+| Image (ViT) | 224×224 RGB | split into 16×16 patches | **dense 768-D vector** (patch embedding) | 196 |
+| Video (ViViT) | 8 frames, 224×224 each | 3D patches (16×16×T) | **dense 768-D vector** (spatio-temporal embedding) | ~500–2000 |
+| Audio (HuBERT) | waveform | mel-spectrogram frames | **dense vector** (frame embedding) | ~1000 |
+
+Notice: **only text uses discrete indices.** All visual/audio modalities use dense embeddings, but we call them "tokens" because they all get fed to Transformers as sequences.
+
+**Why the confusion exists:**
+
+The term "token" in vision is basically a historical accident — when Dosovitskiy et al. introduced Vision Transformers (ViT), they borrowed the term "token" from NLP as a shorthand for "sequence element," but the actual data type is completely different (dense vector vs. integer index). A more precise term would be **"patch embedding"** or **"visual embedding,"** but "token" stuck in the community.
+
+**TL;DR:** Image tokens are **patches of pixels embedded as dense vectors,** not discrete symbols. They're called "tokens" because they're fed to Transformers as a sequence, just like text tokens, but they're fundamentally different data types (768-D floats vs. integers). Vision researchers use the word "token" loosely; what matters is that they're fixed-size sequence elements the Transformer can process.
+
+*Pointer:* [solution.md](solution.md), Step 4A "Multimodal Video/Text Embeddings" — Video Tower; [[ViT vs CNN encoder question above]].
+
+---
+
+## Tradeoffs
+
+*(No questions logged yet.)*
 
 ---
 
