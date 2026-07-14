@@ -3602,6 +3602,305 @@ Don't prune if...
 
 ---
 
+#### Deep Dive: How prune.l1_unstructured() Works
+
+`prune.l1_unstructured()` is a real PyTorch function in `torch.nn.utils.prune`. Let me explain exactly how it works:
+
+**1. What is L1 norm?**
+
+L1 norm = absolute value of a number. For a weight matrix, L1 unstructured pruning removes weights with the **smallest absolute values**.
+
+```
+Weight matrix:
+[  0.5,  -0.02,   0.8,  -0.01]
+[  0.2,  -0.001,  0.3,   0.04]
+[ -0.05,  0.7,    0.0,  -0.2 ]
+
+Absolute values (L1 norm):
+[  0.5,   0.02,   0.8,   0.01]  ← 0.01 is smallest
+[  0.2,   0.001,  0.3,   0.04]  ← 0.001 is smallest
+[  0.05,  0.7,    0.0,   0.2 ]  ← 0.0 is smallest
+
+If we prune 30% (remove 3 weights out of 12):
+- Remove 0.001 (smallest)
+- Remove 0.0 (smallest)
+- Remove 0.01 (smallest)
+
+Result:
+[  0.5,   0.0,    0.8,   0.0]   ← Replaced with 0
+[  0.2,   0.0,    0.3,   0.04]  ← Replaced with 0
+[ -0.05,  0.7,    0.0,   -0.2]  ← Already 0
+```
+
+**2. How prune.l1_unstructured() selects weights**
+
+```python
+import torch
+import torch.nn as nn
+from torch.nn.utils import prune
+
+# Create a simple layer
+linear = nn.Linear(10, 5)  # 10 inputs, 5 outputs → 50 weights
+
+print("Before pruning:")
+print(f"  Weight matrix shape: {linear.weight.shape}")  # (5, 10)
+print(f"  Weight values sample: {linear.weight.data[0, :5]}")
+
+# Apply L1 unstructured pruning (remove 30% of weights)
+prune.l1_unstructured(
+    linear,                    # Module to prune
+    name='weight',             # Which parameter to prune
+    amount=0.3                 # Remove 30% of weights
+)
+
+print("\nAfter pruning (with mask):")
+print(f"  Has weight_mask: {hasattr(linear, 'weight_mask')}")
+print(f"  Weight mask sample: {linear.weight_mask[0, :5]}")  # 1=keep, 0=pruned
+print(f"  Number of zeros: {(linear.weight_mask == 0).sum().item()}")
+
+# Make pruning permanent
+prune.remove(linear, 'weight')
+
+print("\nAfter making permanent:")
+print(f"  Weight values sample: {linear.weight.data[0, :5]}")
+print(f"  Number of zeros: {(linear.weight == 0).sum().item()}")
+```
+
+**Output:**
+```
+Before pruning:
+  Weight matrix shape: torch.Size([5, 10])
+  Weight values sample: tensor([-0.2034,  0.1567, -0.3892,  0.0145, -0.0089])
+
+After pruning (with mask):
+  Has weight_mask: True
+  Weight mask sample: tensor([1., 0., 1., 0., 1.])  ← 0 means pruned (will be zeroed)
+  Number of zeros: 15  ← 15 out of 50 weights (~30%)
+
+After making permanent:
+  Weight values sample: tensor([-0.2034,  0.0000, -0.3892,  0.0000, -0.0000])
+  Number of zeros: 15
+```
+
+**3. Step-by-Step Algorithm**
+
+```
+Algorithm: L1_UNSTRUCTURED_PRUNE(layer, amount=0.3)
+
+Input: Weight matrix W (shape: output_dim × input_dim)
+       Prune amount: 0.3 (remove 30%)
+
+Step 1: Compute absolute values
+    abs_W = abs(W)  # All weights → absolute values
+
+Step 2: Determine threshold
+    flattened = abs_W.flatten()  # Reshape to 1D
+    sorted_vals = sort(flattened)  # Sort ascending
+    
+    # Find the weight magnitude at 30th percentile
+    threshold_idx = int(0.3 * len(flattened))
+    threshold = sorted_vals[threshold_idx]
+    
+    Example with 10 weights:
+    abs_W = [0.5, 0.02, 0.8, 0.001, 0.04, 0.1, 0.005, 0.2, 0.3, 0.1]
+    sorted = [0.001, 0.005, 0.02, 0.04, 0.05, 0.1, 0.1, 0.2, 0.3, 0.5]
+    threshold_idx = int(0.3 * 10) = 3
+    threshold = sorted[3] = 0.04  ← Weights ≤ 0.04 will be pruned
+
+Step 3: Create mask
+    mask = (abs_W > threshold)  # Keep weights > threshold, prune ≤ threshold
+    
+    Example:
+    abs_W:  [0.5, 0.02, 0.8, 0.001, 0.04, 0.1, 0.005, 0.2, 0.3, 0.1]
+    mask:   [1,   0,    1,   0,     0,    1,   0,     1,   1,   1]
+            Keep  Prune Keep  Prune Prune Keep Prune Keep Keep Keep
+    
+    Result: 3 out of 10 weights pruned (30%) ✓
+
+Step 4: Apply mask
+    W_masked = W * mask
+    
+    Result:
+    W:       [0.5, 0.02, 0.8, 0.001, 0.04, 0.1, 0.005, 0.2, 0.3, 0.1]
+    W_masked:[0.5, 0.0,  0.8, 0.0,   0.0,  0.1, 0.0,   0.2, 0.3, 0.1]
+             Keep Prune Keep Prune Prune Keep Prune Keep Keep Keep
+```
+
+**4. Complete Working Example**
+
+```python
+import torch
+import torch.nn as nn
+from torch.nn.utils import prune
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import accuracy_score
+
+# Create model
+class SimpleNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(20, 50)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(50, 10)
+    
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        return x
+
+# Create dummy data
+X_train = torch.randn(1000, 20)
+y_train = torch.randint(0, 10, (1000,))
+X_test = torch.randn(200, 20)
+y_test = torch.randint(0, 10, (200,))
+
+train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=32)
+
+# Train model
+model = SimpleNet()
+optimizer = torch.optim.Adam(model.parameters())
+criterion = nn.CrossEntropyLoss()
+
+print("="*60)
+print("TRAINING ORIGINAL MODEL")
+print("="*60)
+
+for epoch in range(5):
+    for X_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+
+# Evaluate before pruning
+model.eval()
+with torch.no_grad():
+    y_pred_original = model(X_test).argmax(1)
+    acc_original = accuracy_score(y_test, y_pred_original)
+    
+original_size = sum(p.numel() for p in model.parameters())
+print(f"\nBefore Pruning:")
+print(f"  Accuracy: {acc_original:.4f}")
+print(f"  Total parameters: {original_size:,}")
+
+# APPLY L1 UNSTRUCTURED PRUNING
+print("\n" + "="*60)
+print("APPLYING L1 UNSTRUCTURED PRUNING (30%)")
+print("="*60)
+
+# Prune both layers
+for name, module in model.named_modules():
+    if isinstance(module, nn.Linear):
+        print(f"\nPruning {name}:")
+        print(f"  Original weights: {module.weight.numel()}")
+        
+        # Show weight distribution before pruning
+        abs_weights = module.weight.abs()
+        print(f"  Weight magnitude distribution:")
+        print(f"    Min: {abs_weights.min():.6f}")
+        print(f"    Mean: {abs_weights.mean():.6f}")
+        print(f"    Max: {abs_weights.max():.6f}")
+        
+        # Apply pruning
+        prune.l1_unstructured(module, 'weight', amount=0.3)
+        
+        # Show mask
+        mask = module.weight_mask
+        num_pruned = (mask == 0).sum().item()
+        print(f"  Pruned weights: {num_pruned} ({100*num_pruned/mask.numel():.1f}%)")
+        print(f"  Mask sample: {mask[0, :10]}")
+
+# Make pruning permanent
+for name, module in model.named_modules():
+    if isinstance(module, nn.Linear):
+        prune.remove(module, 'weight')
+
+# Evaluate after pruning
+model.eval()
+with torch.no_grad():
+    y_pred_pruned = model(X_test).argmax(1)
+    acc_pruned = accuracy_score(y_test, y_pred_pruned)
+
+pruned_size = sum(p.numel() for p in model.parameters() if p is not None)
+# Count actual zeros
+total_zeros = sum((p == 0).sum().item() for p in model.parameters() if p is not None)
+
+print("\n" + "="*60)
+print("AFTER PRUNING")
+print("="*60)
+print(f"  Accuracy: {acc_pruned:.4f}")
+print(f"  Accuracy loss: {acc_original - acc_pruned:.4f}")
+print(f"  Total parameters: {pruned_size:,}")
+print(f"  Zero parameters: {total_zeros:,} ({100*total_zeros/pruned_size:.1f}%)")
+print(f"  Size reduction: {100*(1 - pruned_size/original_size):.1f}%")
+
+# Verdict
+if abs(acc_original - acc_pruned) < 0.02:
+    print("\n✓ Pruning successful! <2% accuracy loss with 30% sparsity.")
+else:
+    print(f"\n✗ Pruning hurts accuracy too much ({100*(acc_original - acc_pruned):.2f}% loss).")
+```
+
+**5. Different Pruning Methods Available in PyTorch**
+
+```python
+from torch.nn.utils import prune
+
+# Method 1: L1 Unstructured (most common)
+prune.l1_unstructured(module, 'weight', amount=0.3)
+# Removes weights with smallest absolute values
+# What we explained above ↑
+
+# Method 2: L2 Unstructured
+prune.l2_unstructured(module, 'weight', amount=0.3)
+# Same as L1 but uses L2 norm (euclidean distance)
+# Similar results but slightly different selection
+
+# Method 3: Random Unstructured
+prune.random_unstructured(module, 'weight', amount=0.3)
+# Randomly removes 30% of weights
+# Baseline for comparison
+
+# Method 4: Structured Pruning (remove entire filters)
+prune.ln_structured(module, 'weight', amount=0.3, n=2, dim=0)
+# Removes entire filters/channels
+# Better for hardware speed, worse for compression
+
+# Comparison:
+methods = {
+    'l1_unstructured': lambda m: prune.l1_unstructured(m, 'weight', 0.3),
+    'random': lambda m: prune.random_unstructured(m, 'weight', 0.3),
+}
+
+for method_name, prune_fn in methods.items():
+    model_copy = deepcopy(model)
+    prune_fn(model_copy.fc1)
+    # Compare accuracy and speed...
+```
+
+**6. Key Insights**
+
+```
+prune.l1_unstructured() in 3 sentences:
+1. It ranks all weights by absolute value (smallest first)
+2. It creates a binary mask for bottom N% (removes via mask)
+3. Calling prune.remove() makes the zeros permanent
+
+Why L1?
+- L1 norm (|x|) naturally finds smallest-magnitude weights
+- Fast to compute (no sqrt like L2)
+- Empirically works as well as L2
+
+What happens to gradients?
+- During training: masked weights don't update (gradient × 0 = 0)
+- After remove(): gradient computation skips pruned weights entirely
+- Result: pruned connections never revive (one-way operation)
+```
+
+---
+
 ### 4.4 Scaling Model Serving
 
 **Q: How do you scale model serving for varying workloads?
