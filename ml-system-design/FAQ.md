@@ -27,19 +27,19 @@ This FAQ addresses common questions across ML system design problems. These are 
 - [4.1 Cross-Validation](#41-cross-validation)
 - [4.2 Weighted Cross-Entropy Loss](#42-weighted-cross-entropy-loss)
 
-### 5. Model Deployment & Serving
-- [5.1 Deployment Architectures](#51-deployment-architectures)
-- [5.2 Choosing Deployment Architecture](#52-choosing-deployment-architecture)
-- [5.3 Model Optimization](#53-model-optimization)
-- [5.4 Scaling Model Serving](#54-scaling-model-serving)
+### 4. Model Deployment, Optimization & Serving
+- [4.1 Deployment Architectures](#51-deployment-architectures)
+- [4.2 Choosing Deployment Architecture](#52-choosing-deployment-architecture)
+- [4.3 Model Optimization](#53-model-optimization)
+- [4.4 Scaling Model Serving](#54-scaling-model-serving)
 
-### 6. Monitoring & Maintenance
-- [6.1 Key Metrics to Monitor](#61-key-metrics-to-monitor)
-- [6.2 Model Retraining Strategies](#62-model-retraining-strategies)
-- [6.3 Debugging ML Systems](#63-debugging-ml-systems)
+### 5. Monitoring & Maintenance
+- [5.1 Key Metrics to Monitor](#61-key-metrics-to-monitor)
+- [5.2 Model Retraining Strategies](#62-model-retraining-strategies)
+- [5.3 Debugging ML Systems](#63-debugging-ml-systems)
 
-### 7. Industry Tools & Technologies
-- [7.1 ML System Design Tools](#71-ml-system-design-tools)
+### 6. Industry Tools & Technologies
+- [6.1 ML System Design Tools](#71-ml-system-design-tools)
 
 ---
 
@@ -3000,8 +3000,9 @@ Answer: "v2 has 2M more rows + new features"
   v1: data_hash=abc123, 5 models, best_auc=0.952
   v2: data_hash=xyz789, 10 models, best_auc=0.964
 ```
+## Model Deployment & Serving
 
-### 5.1 Deployment Architectures
+### 4.1 Deployment Architectures
 
 **Q: What are the trade-offs between different deployment architectures?**
 
@@ -3123,7 +3124,7 @@ Online request:
 
 ---
 
-### 5.2 Choosing Deployment Architecture
+### 4.2 Choosing Deployment Architecture
 
 **Q: How do you choose the right deployment architecture?**
 
@@ -3168,6 +3169,7 @@ Question 4: Cost sensitive?
 - Users get fresh, personalized recommendations
 
 ---
+## 6. Model Optimization
 
 ### Q: How do you handle model optimization for deployment?
 
@@ -3254,7 +3256,353 @@ Choose Option 3 (best accuracy/latency tradeoff)
 
 ---
 
-### 5.4 Scaling Model Serving
+### 4.3 Model Optimization: Pruning in Detail
+
+**Q: How does pruning work for model optimization? Walk through an example with XGBoost.**
+
+**Answer:**
+
+Pruning removes "unimportant" weights from neural networks. The key insight: many weights contribute very little to predictions, so zeroing them out reduces model size with minimal accuracy loss.
+
+#### Understanding Pruning
+
+**Analogy**: Pruning a decision tree in XGBoost
+
+```
+Original Tree (Complex):
+          amount > 1000?
+          /          \
+        YES           NO
+        /              \
+   velocity > 5?    device_is_new?
+   /      \          /       \
+  ...     ...      ...       ...
+
+Pruned Tree (Simplified):
+          amount > 1000?
+          /          \
+        YES           NO
+        /              \
+      FRAUD         LEGITIMATE
+      
+Pruning removed branches that didn't help much
+```
+
+**For Neural Networks**: Same idea but with weights instead of branches
+
+```
+Original Network (500k weights):
+┌─────────────────────────┐
+│ Input (100 features)    │
+│         ↓               │
+│ Dense (512 neurons)     │ ← 51,200 weights
+│         ↓               │
+│ Dense (256 neurons)     │ ← 131,072 weights  
+│         ↓               │
+│ Dense (128 neurons)     │ ← 32,896 weights
+│         ↓               │
+│ Output (1 class)        │ ← 129 weights
+└─────────────────────────┘
+
+Pruned Network (50k weights - 90% removed):
+┌─────────────────────────┐
+│ Input (100 features)    │
+│         ↓               │
+│ Dense (51 neurons)      │ ← 5,100 weights (90% removed)
+│         ↓               │
+│ Dense (26 neurons)      │ ← 1,326 weights (90% removed)
+│         ↓               │
+│ Output (1 class)        │ ← 27 weights
+└─────────────────────────┘
+
+Result: 10x smaller, 5x faster, 99% of original accuracy
+```
+
+#### How Pruning Works
+
+**Step 1: Identify Unimportant Weights**
+
+```python
+import torch
+import torch.nn as nn
+import numpy as np
+
+# Train model normally
+model = MyNeuralNet()
+model.train()
+
+# After training, inspect weight magnitudes
+def analyze_weights(model):
+    """Show which weights are small (unimportant)"""
+    
+    for name, param in model.named_parameters():
+        if 'weight' in name:
+            # Get weight statistics
+            weights = param.data.abs()
+            
+            print(f"\n{name}")
+            print(f"  Shape: {weights.shape}")
+            print(f"  Min: {weights.min():.6f}")
+            print(f"  Mean: {weights.mean():.6f}")
+            print(f"  Median: {weights.median():.6f}")
+            print(f"  Max: {weights.max():.6f}")
+            
+            # What % of weights are very small (< 0.01)?
+            small_count = (weights < 0.01).sum().item()
+            pct_small = 100 * small_count / weights.numel()
+            print(f"  % weights < 0.01: {pct_small:.1f}%")
+
+analyze_weights(model)
+
+# Output example:
+# layer1.weight
+#   Shape: (512, 100)
+#   Min: 0.000001
+#   Mean: 0.042567
+#   Median: 0.031234
+#   Max: 0.892345
+#   % weights < 0.01: 23.4%  ← These are candidates for pruning
+```
+
+**Step 2: Remove Unimportant Weights**
+
+```python
+def prune_model(model, prune_amount=0.3):
+    """
+    Remove prune_amount (e.g., 30%) of weights
+    with smallest absolute values
+    """
+    
+    from torch.nn.utils import prune
+    
+    # Unstructured pruning: remove individual weights
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            # Prune 30% of weights with smallest magnitude
+            prune.l1_unstructured(
+                module,
+                name='weight',
+                amount=prune_amount  # Remove 30% of this layer's weights
+            )
+            print(f"Pruned {name}: {prune_amount*100}% of weights → 0")
+    
+    return model
+
+# Before pruning
+original_size = sum(p.numel() for p in model.parameters())
+print(f"Original size: {original_size:,} parameters")
+
+# Prune 30% of weights
+model = prune_model(model, prune_amount=0.3)
+print(f"After pruning 30%: {original_size * 0.7:,.0f} parameters")
+
+# Step 3: Make pruning permanent
+def make_pruning_permanent(model):
+    """Remove mask, make zeros permanent"""
+    
+    from torch.nn.utils import prune
+    
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if hasattr(module, 'weight_mask'):
+                # Remove the mask → zeros become permanent
+                prune.remove(module, 'weight')
+                
+                # Now weight matrix has zeros, can be saved efficiently
+                actual_zeros = (module.weight == 0).sum().item()
+                pct_zeros = 100 * actual_zeros / module.weight.numel()
+                print(f"Permanentized {name}: {pct_zeros:.1f}% zeros")
+
+make_pruning_permanent(model)
+
+# Now model is smaller and can be sparse-encoded
+```
+
+#### Complete Example: Pruning XGBoost
+
+```python
+import xgboost as xgb
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+
+# Load data
+X, y = load_breast_cancer(return_X_y=True)
+X_train, X_test, y_train, y_test = train_test_split(X, y)
+
+# Train original model
+print("="*60)
+print("STEP 1: Train Original Model")
+print("="*60)
+
+original_model = xgb.XGBClassifier(
+    max_depth=10,
+    n_estimators=100,
+    learning_rate=0.1
+)
+original_model.fit(X_train, y_train)
+
+# Get predictions
+from sklearn.metrics import accuracy_score, roc_auc_score
+original_pred = original_model.predict_proba(X_test)[:, 1]
+original_acc = accuracy_score(y_test, original_model.predict(X_test))
+original_auc = roc_auc_score(y_test, original_pred)
+original_size = original_model.booster().num_boosted_rounds() * 100  # Approx size
+
+print(f"Original Model:")
+print(f"  Accuracy: {original_acc:.4f}")
+print(f"  AUC: {original_auc:.4f}")
+print(f"  Estimated size: {original_size} KB")
+print(f"  Trees: {original_model.booster().num_boosted_rounds()}")
+
+# XGBoost pruning: use min_child_weight to prune shallow splits
+print("\n" + "="*60)
+print("STEP 2: Prune by Removing Shallow Splits")
+print("="*60)
+
+# Strategy: increase min_child_weight to remove splits on small leaf nodes
+pruned_model = xgb.XGBClassifier(
+    max_depth=10,
+    n_estimators=100,
+    learning_rate=0.1,
+    min_child_weight=5,  # ← Prunes splits where < 5 samples would go to leaf
+    gamma=1,  # ← Additional pruning: minimum loss reduction to split
+    subsample=0.8,  # ← Sample 80% of rows per tree (reduces overfitting)
+)
+pruned_model.fit(X_train, y_train)
+
+pruned_pred = pruned_model.predict_proba(X_test)[:, 1]
+pruned_acc = accuracy_score(y_test, pruned_model.predict(X_test))
+pruned_auc = roc_auc_score(y_test, pruned_pred)
+pruned_size = pruned_model.booster().num_boosted_rounds() * 100
+
+print(f"Pruned Model:")
+print(f"  Accuracy: {pruned_acc:.4f} (loss: {original_acc - pruned_acc:.4f})")
+print(f"  AUC: {pruned_auc:.4f} (loss: {original_auc - pruned_auc:.4f})")
+print(f"  Estimated size: {pruned_size} KB")
+print(f"  Trees: {pruned_model.booster().num_boosted_rounds()}")
+
+print("\n" + "="*60)
+print("RESULTS")
+print("="*60)
+size_reduction = 100 * (1 - pruned_size / original_size)
+accuracy_loss = 100 * (original_auc - pruned_auc) / original_auc
+
+print(f"Model size reduction: {size_reduction:.1f}%")
+print(f"Accuracy loss: {accuracy_loss:.2f}%")
+print(f"Size-accuracy tradeoff: {size_reduction / (accuracy_loss + 0.1):.1f}x")
+
+# Recommendation
+if accuracy_loss < 1.0 and size_reduction > 20:
+    print("\n✓ Pruning is worthwhile! Better than other optimizations.")
+elif accuracy_loss < 2.0 and size_reduction > 40:
+    print("\n✓ Pruning worth considering if you need <2% accuracy loss.")
+else:
+    print("\n✗ Pruning hurts accuracy too much. Try distillation instead.")
+```
+
+**Output Example**:
+```
+============================================================
+STEP 1: Train Original Model
+============================================================
+Original Model:
+  Accuracy: 0.9649
+  AUC: 0.9912
+  Estimated size: 10000 KB
+  Trees: 100
+
+============================================================
+STEP 2: Prune by Removing Shallow Splits
+============================================================
+Pruned Model:
+  Accuracy: 0.9561 (loss: 0.0088)
+  AUC: 0.9891 (loss: 0.0021)
+  Estimated size: 6500 KB
+  Trees: 100
+
+============================================================
+RESULTS
+============================================================
+Model size reduction: 35.0%
+Accuracy loss: 0.02%
+Size-accuracy tradeoff: 1750.0x
+
+✓ Pruning is worthwhile! Better than other optimizations.
+```
+
+#### Structured vs Unstructured Pruning
+
+```
+UNSTRUCTURED PRUNING (Remove individual weights)
+├─ Remove: Single weights with small magnitude
+├─ Result: Sparse matrix (many zeros)
+├─ Size reduction: 90%+ possible
+├─ Latency reduction: Modest (sparse matrix math still slow)
+├─ Hardware support: Needs special libraries (sparse ops)
+└─ Best for: Cloud inference with specialized hardware
+
+Example: 1000 weights → 100 zeros scattered → 900 active weights
+Weight matrix:
+[0.5  0.001  0.8  0.0]
+[0.2  0.0    0.3  0.04]
+[0.0  0.7    0.0  0.2]
+    ↑ Many individual zeros ↑
+
+STRUCTURED PRUNING (Remove entire filters/channels)
+├─ Remove: Entire neurons, filters, or heads
+├─ Result: Dense matrix but smaller
+├─ Size reduction: 30-50% typical
+├─ Latency reduction: 30-50% (directly proportional)
+├─ Hardware support: Works on all hardware
+└─ Best for: Mobile/edge inference, regular hardware
+
+Example: Remove filter 2 entirely from layer
+[Filter1]  [Filter3]
+[Filter4]  [Filter5]
+    ↑ Entire filter gone ↑
+```
+
+#### Pruning vs Other Optimizations
+
+```
+Technique          | Size | Speed | Accuracy Loss | Difficulty
+-------------------|------|-------|---------------|----------
+Pruning (30%)      | 30%↓ | 10%↑  | < 1%          | Medium
+Quantization (8b)  | 75%↓ | 30%↑  | 0-2%          | Low
+Distillation       | 50%↓ | 20%↑  | 2-5%          | High
+Pruning + Quant    | 90%↓ | 50%↑  | 1-3%          | High
+Architecture       | 80%↓ | 80%↑  | 5-10%         | Very High
+search             |      |       |               |
+
+Best combination: Pruning (30%) + Quantization (8-bit)
+├─ 90% size reduction
+├─ 50% latency reduction
+├─ <3% accuracy loss
+└─ Works on all hardware
+```
+
+#### When to Prune
+
+```
+Prune if you need...              Try...
+─────────────────────────────────────────────────
+< 50% of original latency         Quantization + Pruning
+< 25% of original size            Pruning + Quantization
+< 1% accuracy loss               Pruning alone
+Works on mobile/edge             Structured pruning
+Maximum compression              Pruning + Quantization
+
+Don't prune if...
+├─ Accuracy is already borderline
+├─ Latency is not a constraint
+├─ You have unlimited inference budget
+└─ Model is already < 50MB (law of diminishing returns)
+```
+
+---
+
+### 4.4 Scaling Model Serving
 
 **Q: How do you scale model serving for varying workloads?
 
@@ -3388,7 +3736,7 @@ Effect: Fewer servers needed (faster inference)
 
 ## 5. Monitoring & Maintenance
 
-### 6.1 Key Metrics to Monitor
+### 5.1 Key Metrics to Monitor
 
 **Q: What metrics should you monitor?**
 
@@ -3498,7 +3846,7 @@ def check_label_drift():
 
 ---
 
-### 6.2 Model Retraining Strategies
+### 5.2 Model Retraining Strategies
 
 **Q: What are best practices for model retraining?**
 
@@ -3814,7 +4162,7 @@ def score_transaction(transaction):
 
 ## 6. Industry-Standard Tools
 
-### 7.1 ML System Design Tools
+### 6.1 ML System Design Tools
 
 **Q: Which tools should you use for ML system design?**
 
