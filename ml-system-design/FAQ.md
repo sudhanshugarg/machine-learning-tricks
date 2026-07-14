@@ -83,6 +83,279 @@ class_weight = len(y[y==0]) / len(y[y==1])  # Fraud is minority
 model.fit(X_train, y_train, sample_weight=...)
 ```
 
+---
+
+### Q: How exactly do you implement oversampling vs undersampling? What do you modify in model.fit() and loss functions?
+
+**Answer:**
+
+When dealing with imbalanced data (fraud is 0.1%, legitimate is 99.9%), you have three main approaches:
+
+#### Approach 1: Oversampling (Duplicate minority class)
+
+**What it does**: Duplicate fraud examples until classes are balanced (1:1 ratio)
+
+```python
+import numpy as np
+from imblearn.over_sampling import RandomOverSampler, SMOTE
+
+# Original data
+X_train = np.array([[1,2], [3,4], [5,6], [7,8], [9,10]])
+y_train = np.array([0, 0, 0, 0, 1])  # 1 fraud, 4 legitimate
+# Ratio: 80% legitimate, 20% fraud
+
+# Method 1: Random Oversampling (simple duplication)
+ros = RandomOverSampler(sampling_strategy='minority')
+X_resampled, y_resampled = ros.fit_resample(X_train, y_train)
+# Result: [[1,2], [3,4], [5,6], [7,8], [9,10], [9,10], [9,10], [9,10], [9,10]]
+#         [0,    0,    0,    0,    1,    1,    1,    1,    1]
+# Ratio: 50% legitimate, 50% fraud (balanced)
+
+# Method 2: SMOTE (Synthetic Minority Over-sampling)
+# Creates synthetic fraud samples by interpolating between existing ones
+smote = SMOTE(sampling_strategy='minority', k_neighbors=5)
+X_resampled, y_resampled = smote.fit_resample(X_train, y_train)
+# Result: Original samples + synthetic samples (not duplicates!)
+# Better than random oversampling (less overfitting)
+```
+
+**Pros**:
+- More training data (more samples to learn from)
+- Less information loss than undersampling
+- Good for small datasets
+
+**Cons**:
+- Risk of overfitting (duplicated samples too similar)
+- Larger training dataset (slower training)
+- Can create unrealistic synthetic samples (SMOTE)
+
+---
+
+#### Approach 2: Undersampling (Remove majority class)
+
+**What it does**: Randomly remove legitimate examples until classes are balanced
+
+```python
+from imblearn.under_sampling import RandomUnderSampler
+
+# Original data
+X_train = np.array([[1,2], [3,4], [5,6], [7,8], [9,10]])
+y_train = np.array([0, 0, 0, 0, 1])  # 1 fraud, 4 legitimate
+
+# Random Undersampling
+rus = RandomUnderSampler(sampling_strategy='majority')
+X_resampled, y_resampled = rus.fit_resample(X_train, y_train)
+# Result: Keep all fraud, randomly remove legitimate samples
+# Example: [[1,2], [5,6], [9,10]]
+#          [0,    0,    1]
+# Ratio: 66% legitimate, 33% fraud (more balanced)
+```
+
+**Pros**:
+- Faster training (fewer samples)
+- No overfitting risk from duplicates
+- Simple to implement
+
+**Cons**:
+- Lose information (discard data)
+- Only works when you have lots of data
+- Might remove important patterns
+
+---
+
+#### Approach 3: Class Weights (Keep all data, weight samples during training)
+
+**What it does**: Give higher weight to minority class during training (no data removal/duplication)
+
+```python
+from sklearn.utils.class_weight import compute_class_weight
+
+# Original imbalanced data (kept as-is!)
+X_train = np.array([[1,2], [3,4], [5,6], [7,8], [9,10]])
+y_train = np.array([0, 0, 0, 0, 1])  # 1 fraud, 4 legitimate
+
+# Compute class weights
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(y_train),
+    y=y_train
+)
+# Result: class_weights = [0.625, 2.5]
+# Fraud weight: 2.5 (5x higher because rare)
+# Legitimate weight: 0.625
+
+# Train with class weights
+# Method 1: XGBoost
+model = xgb.XGBClassifier(scale_pos_weight=class_weights[1]/class_weights[0])
+model.fit(X_train, y_train)
+
+# Method 2: scikit-learn with sample_weight
+model = LogisticRegression(class_weight='balanced')
+model.fit(X_train, y_train)
+
+# Method 3: Manual sample_weight
+sample_weight = np.array([class_weights[int(label)] for label in y_train])
+# sample_weight = [0.625, 0.625, 0.625, 0.625, 2.5]
+model.fit(X_train, y_train, sample_weight=sample_weight)
+```
+
+---
+
+#### Approach 4: Modified Loss Function (PyTorch)
+
+If you're using PyTorch or TensorFlow, you can modify the loss function to weight classes:
+
+```python
+import torch
+import torch.nn as nn
+
+# Original imbalanced data
+X_train = torch.tensor([[1,2], [3,4], [5,6], [7,8], [9,10]], dtype=torch.float32)
+y_train = torch.tensor([0, 0, 0, 0, 1], dtype=torch.long)
+
+# Compute class weights
+class_counts = torch.bincount(y_train)
+class_weights = 1.0 / class_counts.float()
+class_weights = class_weights / class_weights.sum() * len(class_weights)
+# class_weights = [0.625, 2.5]
+
+# Method 1: Weighted Cross Entropy Loss (most common)
+loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+
+# During training
+for epoch in range(10):
+    logits = model(X_train)
+    loss = loss_fn(logits, y_train)
+    loss.backward()
+    optimizer.step()
+
+# What happens inside loss function:
+# For legitimate (class 0): loss_weight = 0.625
+# For fraud (class 1): loss_weight = 2.5
+# Fraud examples contribute 4x more to loss than legitimate examples
+# So model focuses on getting fraud right
+
+# Method 2: Focal Loss (for extreme imbalance)
+# Focuses on hard examples, downweights easy examples
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, inputs, targets):
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        
+        # Probability of true class
+        p = torch.exp(-ce_loss)
+        
+        # Focal loss = -alpha * (1-p)^gamma * ce_loss
+        # If p is high (easy example): (1-p)^gamma ≈ 0 (downweight)
+        # If p is low (hard example): (1-p)^gamma ≈ 1 (upweight)
+        focal_weight = (1 - p) ** self.gamma
+        focal_loss = self.alpha * focal_weight * ce_loss
+        
+        return focal_loss.mean()
+
+loss_fn = FocalLoss()
+```
+
+---
+
+#### Comparison Table
+
+| Approach | Method | Pros | Cons | When to Use |
+|----------|--------|------|------|-------------|
+| **Oversampling** | Random duplication | More data | Risk of overfitting | Small dataset, fraud rate < 1% |
+| **Oversampling** | SMOTE | No duplication, synthetic samples | Creates unrealistic samples | Medium dataset, interpretability matters |
+| **Undersampling** | Random removal | Fast training | Loss of information | Large dataset, balanced is fast enough |
+| **Class Weights** | In model.fit() | Keep all data, no data manipulation | Doesn't change learned decision boundary | Default approach, reliable |
+| **Modified Loss** | Weighted cross-entropy | Fine-grained control | More complex | TensorFlow/PyTorch projects |
+| **Modified Loss** | Focal loss | Focus on hard examples | Complex hyperparameters (alpha, gamma) | Extreme imbalance (0.01%) |
+
+---
+
+#### Practical Recommendations for Fraud Detection
+
+**Scenario 1: Fraud rate = 0.1% (1 fraud per 1000 transactions)**
+```python
+# Combine approach: Undersampling + Class Weights
+# - Undersample legitimate to 10:1 ratio (10 legit per 1 fraud)
+# - Use class weights for remaining imbalance
+
+from imblearn.under_sampling import RandomUnderSampler
+
+rus = RandomUnderSampler(sampling_strategy=0.1)  # 10% minority ratio
+X_train_us, y_train_us = rus.fit_resample(X_train, y_train)
+
+# Train with class weights
+class_weight = {
+    0: 1.0,
+    1: 10.0  # Fraud still 10x weight
+}
+
+model = xgb.XGBClassifier(scale_pos_weight=10.0)
+model.fit(X_train_us, y_train_us)
+
+# Why this works:
+# - Undersampling: Reduces training from 1M to 100k (faster)
+# - Class weights: Handles remaining imbalance
+```
+
+**Scenario 2: You have a LOT of data (millions of transactions)**
+```python
+# Just use class weights, no sampling
+# You have enough data, no need to remove it
+
+class_weight = {0: 1.0, 1: 100.0}  # 100:1 ratio
+model = xgb.XGBClassifier(scale_pos_weight=100.0)
+model.fit(X_train, y_train)
+
+# No need for oversampling/undersampling
+# Class weights are sufficient
+```
+
+**Scenario 3: You want the absolute best performance (and have time)**
+```python
+# Use SMOTE + Class Weights
+# Pros: Synthetic samples + proper weighting
+# Cons: More complex, longer training
+
+from imblearn.over_sampling import SMOTE
+
+smote = SMOTE(sampling_strategy=0.3)  # 30% minority ratio
+X_train_smote, y_train_smote = smote.fit_resample(X_train, y_train)
+
+class_weight = {0: 1.0, 1: 3.33}  # Remaining imbalance
+model = xgb.XGBClassifier(scale_pos_weight=3.33)
+model.fit(X_train_smote, y_train_smote)
+```
+
+---
+
+#### Key Points to Remember
+
+1. **Class weights are the simplest and most reliable** — use this first
+2. **Oversampling risks overfitting** but gives more data
+3. **Undersampling loses information** but is faster
+4. **Combine approaches** for best results (undersample + class weights)
+5. **Test on original distribution** — evaluate on test set without resampling
+6. **Always use stratified splits** — preserve class ratios in train/val/test
+
+```python
+# WRONG: Resampling before train/test split
+X_resampled, y_resampled = oversample(X, y)
+X_train, X_test, y_train, y_test = train_test_split(X_resampled, y_resampled)
+# Test set is now balanced (not representative of real data)
+
+# CORRECT: Split first, then resample training set only
+X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y)
+X_train_resampled, y_train_resampled = oversample(X_train, y_train)
+# Test set remains imbalanced (representative of real data)
+model.fit(X_train_resampled, y_train_resampled)
+model.evaluate(X_test, y_test)  # Evaluated on real distribution
+```
+
 #### Inconsistencies
 - **Identify**:
   - **Format inconsistencies**: Date formats, currency, units
