@@ -4802,7 +4802,167 @@ task_weight = 0.0
 
 ---
 
-**9. When Distillation Works Best**
+**9. Forward KL vs Reverse KL: Mean-Covering vs Mode-Seeking**
+
+This is crucial to understanding distillation behavior!
+
+**What are Forward and Reverse KL?**
+
+```
+Forward KL:  KL(P || Q) = sum(P * log(P/Q))
+  → "True" KL divergence
+  → P is reference, Q is approximation
+  → Penalizes Q for missing probability from P
+
+Reverse KL:  KL(Q || P) = sum(Q * log(Q/P))
+  → Reverse direction
+  → Q is reference, P is approximation  
+  → Penalizes P for having probability where Q has none
+```
+
+**Forward KL is Mean-Covering (covers all modes)**
+
+```
+Teacher distribution P has 2 modes (bimodal):
+P = [0.45, 0.05, 0.45]  ← Mode at position 0 and 2
+
+If we use Forward KL to fit Q to P:
+KL(P || Q) = sum(P * log(P/Q))
+           = 0.45*log(0.45/q0) + 0.05*log(0.05/q1) + 0.45*log(0.45/q2)
+
+Problem: If student tries to ignore mode 2 (set q2=0.01):
+  → q2 term becomes: 0.45 * log(0.45/0.01) = 0.45 * 3.8 = VERY HIGH COST
+  → Forces student to cover both modes!
+
+Best Q (forward KL):
+Q = [0.45, 0.05, 0.45]  ← Matches P exactly (covers both modes)
+```
+
+**Visual Comparison:**
+
+```
+TEACHER (bimodal):        FORWARD KL (mean-covering):  REVERSE KL (mode-seeking):
+    P                         Q                            Q
+   /|\                       /|\                          /
+  / | \                     / | \                        /
+ /  |  \                   /  |  \                      /
+|___|___|                 |___|___|                    |___|___|
+
+Two modes              Covers both modes         Picks one mode
+High, High            High, Low, High           High, Tiny, Tiny
+[0.4, 0.2, 0.4]      [0.4, 0.2, 0.4]          [0.9, 0.05, 0.05]
+```
+
+**Reverse KL is Mode-Seeking (picks one mode)**
+
+```
+Teacher distribution P has 2 modes:
+P = [0.45, 0.05, 0.45]  ← Mode at position 0 and 2
+
+If we use Reverse KL to fit P to Q:
+KL(Q || P) = sum(Q * log(Q/P))
+           = q0*log(q0/0.45) + q1*log(q1/0.05) + q2*log(q2/0.45)
+
+Student wants to put all probability on mode 0:
+Q = [1.0, 0.0, 0.0]
+
+Cost = 1.0*log(1.0/0.45) + 0.0*log(...) + 0.0*log(...)
+     = 1.0 * log(2.22)
+     = 0.8  ← Low cost!
+
+The zero terms don't contribute (0*log = 0)
+Only mode 0 matters, can ignore mode 2!
+```
+
+**Why This Matters for Distillation**
+
+```
+Using Reverse KL (what PyTorch does):
+  ✓ Student can specialize on best mode (efficient)
+  ✓ Don't waste capacity on low-probability regions
+  ✓ Creates smaller, faster models (good for compression!)
+  ✗ Misses minority modes that teacher covers
+  ✗ Student becomes overconfident (sharper distribution)
+
+Using Forward KL (alternative):
+  ✓ Student covers all modes (more robust)
+  ✓ Preserves teacher's uncertainty
+  ✗ Student needs capacity for all modes (slower)
+  ✗ Worse compression (student isn't focused)
+```
+
+**Concrete Example: Multi-class Classification**
+
+```
+Suppose teacher predicts 3 classes with confusion:
+Class A (fraud):     [0.60, 0.30, 0.10]
+Class B (risky):     [0.30, 0.60, 0.10]
+Class C (safe):      [0.10, 0.10, 0.80]
+
+FORWARD KL (mean-covering):
+Student must cover all three distributions well:
+Class A: [0.58, 0.32, 0.10]  ← Close to teacher
+Class B: [0.32, 0.58, 0.10]  ← Close to teacher
+Class C: [0.10, 0.10, 0.80]  ← Close to teacher
+→ Student learns nuanced distinction between A and B
+
+REVERSE KL (mode-seeking):
+Student can specialize:
+Class A: [0.95, 0.04, 0.01]  ← Picked mode (fraud)
+Class B: [0.04, 0.95, 0.01]  ← Picked mode (risky)
+Class C: [0.01, 0.01, 0.98]  ← Picked mode (safe)
+→ Student becomes sharp/confident, forgets about confusion
+```
+
+**Why Reverse KL in Distillation?**
+
+In knowledge distillation, we use **reverse KL** (F.kl_div with target=teacher):
+
+```python
+loss = F.kl_div(
+    F.log_softmax(student_logits / T, dim=1),  # input
+    teacher_soft,                               # target
+    reduction='batchmean'
+)
+
+# This computes: KL(teacher_soft || student_soft)
+# Which is REVERSE KL (mode-seeking)
+```
+
+Why reverse KL and not forward?
+
+```
+Forward KL: KL(student || teacher)
+  → Would force student to match all of teacher's modes
+  → Student stays uncertain like teacher
+  → Defeats purpose of distillation (student stays big/slow)
+
+Reverse KL: KL(teacher || student)
+  → Allows student to specialize on best modes
+  → Student becomes sharp/confident
+  → Student is smaller and faster (compression works!)
+  → This is what we want!
+```
+
+**The Tradeoff**
+
+```
+Reverse KL (what we use):
+  ✓ Student is sharper, smaller, faster
+  ✓ Better compression
+  ✗ Student loses minority modes
+  ✗ Student becomes overconfident
+
+Solution: Combine with task loss
+  task_loss = cross_entropy(student, hard_labels)
+  
+This prevents student from drifting too far from truth
+Hard labels anchor the student to original task
+```
+
+---
+
+**11. When Distillation Works Best**
 
 ```
 ✓ Works well when:
@@ -4818,7 +4978,7 @@ task_weight = 0.0
   └─ Student architecture is too small to learn
 ```
 
-**10. Distillation vs Other Compression Techniques**
+**12. Distillation vs Other Compression Techniques**
 
 ```
 Technique              | Size | Speed | Accuracy | Difficulty
