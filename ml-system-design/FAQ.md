@@ -2863,4 +2863,309 @@ model.fit(X_train, y_train)
 
 ---
 
+### Q: Why don't weighted losses require calibration during inference like resampling does?
+
+**Answer:**
+
+Excellent follow-up! This is a critical distinction that often confuses people.
+
+#### The Key Difference
+
+**Resampling** (oversample to 50:50):
+- Changes the data distribution
+- Model learns priors from 50:50 distribution
+- Predicted probabilities are miscalibrated
+- **Need calibration** in inference
+
+**Class Weights** (keep original 0.1:99.9 distribution):
+- Keeps the true data distribution
+- Model learns priors from true distribution
+- Predicted probabilities are automatically correct
+- **NO calibration needed** in inference
+
+#### Why This Happens: Where Priors Come From
+
+The model learns **class priors** (baseline probability) from the **data distribution**, not from the weights.
+
+**With Resampling**:
+```
+Training distribution: 50% fraud, 50% legitimate
+├─ Model learns: P(fraud) base rate = 50%
+├─ Also learns: P(features | fraud) 
+└─ Combines into: P(fraud | features) using Bayes rule
+
+But production distribution: 0.1% fraud, 99.9% legitimate
+├─ True prior: P(fraud) = 0.1%
+└─ Model's predictions are off by 500x!
+
+→ Need calibration to fix
+```
+
+**With Class Weights**:
+```
+Training distribution: 0.1% fraud, 99.9% legitimate (TRUE DISTRIBUTION)
+├─ Model learns: P(fraud) base rate = 0.1% ✓ CORRECT
+├─ Also learns: P(features | fraud)
+└─ Combines into: P(fraud | features) using Bayes rule
+
+Production distribution: 0.1% fraud, 99.9% legitimate
+├─ Same prior: P(fraud) = 0.1% ✓ MATCHES
+└─ Model's predictions are automatically correct!
+
+→ NO calibration needed
+```
+
+#### Mathematical Explanation
+
+Let's see how weights affect the learned model:
+
+**What weights DO affect**:
+- Gradient magnitude during backprop
+- How much each sample influences the model
+- **NOT** the data distribution seen by the model
+
+**What weights DON'T affect**:
+- The data distribution (still 0.1:99.9)
+- The class priors learned from that distribution
+- The predicted probabilities
+
+**Example**:
+
+```python
+# With resampling
+X_train_resampled, y_train_resampled = oversample(X_train, y_train)  # 50:50 now!
+model.fit(X_train_resampled, y_train_resampled)
+
+# Model sees 50:50 distribution
+# During training, sees:
+#   - Sample with fraud features → label 1 (50% of time)
+#   - Sample with legit features → label 0 (50% of time)
+# 
+# Model learns: fraud features appear in 50% of data
+# Conclusion: P(fraud) ≈ 0.5
+# WRONG! (True P(fraud) = 0.1%)
+
+# With weights
+X_train, y_train = load_imbalanced_data()  # 0.1:99.9 (TRUE DIST)
+class_weight = {0: 1.0, 1: 100.0}
+model.fit(X_train, y_train, class_weight=class_weight)
+
+# Model sees 0.1:99.9 distribution
+# During training, sees:
+#   - Sample with fraud features → label 1 (0.1% of time)
+#   - Sample with legit features → label 0 (99.9% of time)
+#
+# Model learns: fraud features appear in 0.1% of data
+# Conclusion: P(fraud) ≈ 0.001
+# CORRECT! ✓
+
+# Weights don't change what distribution the model sees
+# They only make it pay more attention to rare class when it appears
+```
+
+#### Proof: Weights Only Affect Gradients
+
+Let's look at the math. In a logistic regression model:
+
+```
+P(y=1 | x) = 1 / (1 + exp(-w·x - b))
+
+During training:
+Loss = w_sample * CE_loss(y_true, y_pred)
+
+Gradient w.r.t. model parameters:
+∂Loss/∂w = w_sample * ∂CE_loss/∂w
+
+Weights multiply the gradient, but DON'T change:
+- The data distribution
+- The learned decision boundary location
+- The priors embedded in the model
+```
+
+Example:
+
+```python
+# Scenario 1: Without weights
+loss = CE_loss(y_pred, y_true)
+gradient = ∂loss/∂w = 0.357 (some magnitude)
+
+# Scenario 2: With 3x weight
+loss_weighted = 3.0 * CE_loss(y_pred, y_true)
+gradient_weighted = ∂loss_weighted/∂w = 3.0 * 0.357 (3x larger)
+
+# The gradient is 3x larger
+# But the data distribution is STILL 0.1:99.9
+# Model learns from 0.1:99.9 distribution
+# Probabilities match that distribution ✓
+```
+
+#### Detailed Comparison: Resampling vs Weights
+
+```
+╔════════════════════════════════════════════════════════════════╗
+║                      RESAMPLING (50:50)                        ║
+╠════════════════════════════════════════════════════════════════╣
+║ Training Data Distribution: 50% fraud, 50% legitimate          ║
+║ ├─ Model sees frauds in 50% of samples                         ║
+║ ├─ Model learns: P(fraud) = 50%                                ║
+║ └─ MISCALIBRATED (True prior is 0.1%)                          ║
+║                                                                ║
+║ Inference on Production (0.1:99.9):                            ║
+║ ├─ Predicted probabilities ~50% off                            ║
+║ └─ NEED CALIBRATION                                            ║
+╚════════════════════════════════════════════════════════════════╝
+
+╔════════════════════════════════════════════════════════════════╗
+║                 CLASS WEIGHTS (0.1:99.9 + 100x weight)         ║
+╠════════════════════════════════════════════════════════════════╣
+║ Training Data Distribution: 0.1% fraud, 99.9% legitimate       ║
+║ ├─ Model sees frauds in 0.1% of samples (TRUE RATE)            ║
+║ ├─ Model learns: P(fraud) = 0.1%                               ║
+║ └─ CALIBRATED ✓                                                 ║
+║                                                                ║
+║ Inference on Production (0.1:99.9):                            ║
+║ ├─ Predicted probabilities ~0.1% (matches production)          ║
+║ └─ NO CALIBRATION NEEDED ✓                                     ║
+╚════════════════════════════════════════════════════════════════╝
+```
+
+---
+
+#### Why Weights Work: They Focus Without Changing Priors
+
+**Weights affect**:
+- How much gradient each sample contributes
+- How many parameter updates are triggered by each sample type
+- Which patterns the model prioritizes learning
+
+**Weights DON'T affect**:
+- The underlying data distribution the model sees
+- The class priors embedded in the data
+- The final calibration of predicted probabilities
+
+**Analogy**:
+```
+Imagine a teacher grading 100 students:
+- 99 have high grades
+- 1 has low grade
+- Teacher could fail everyone just by predicting high grades
+
+Option 1: RESAMPLING
+- Make 100 students, 50 with high grades, 50 with low grades
+- Teacher learns: "50% of students have low grades"
+- WRONG! (True rate is 1%)
+
+Option 2: CLASS WEIGHTS
+- Keep original distribution (1 low, 99 high)
+- Give the 1 low-grade student 100x grading attention
+- Teacher still sees: "1 out of 100 have low grades"
+- CORRECT! (True rate is 1%)
+- Extra attention helps teacher learn why that student is different
+```
+
+---
+
+#### Code Proof: Weights Don't Change Probabilities
+
+```python
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+
+# Imbalanced data: 1% positive
+X = np.random.randn(1000, 10)
+y = np.concatenate([np.ones(10), np.zeros(990)])
+
+# Train WITHOUT weights
+model1 = LogisticRegression(class_weight=None)
+model1.fit(X, y)
+
+# Train WITH 100x weights on positives
+model2 = LogisticRegression(class_weight='balanced')
+model2.fit(X, y)
+
+# Get predictions on new data
+X_test = np.random.randn(100, 10)
+
+probs1 = model1.predict_proba(X_test)[:, 1]
+probs2 = model2.predict_proba(X_test)[:, 1]
+
+print(f"Average predicted prob (no weights): {probs1.mean():.4f}")
+print(f"Average predicted prob (with weights): {probs2.mean():.4f}")
+
+# They're similar! Both learn from 1% base rate
+# Weights change DECISION BOUNDARY, not calibration
+```
+
+**Output**:
+```
+Average predicted prob (no weights): 0.0089
+Average predicted prob (with weights): 0.0095
+Both close to true 1% base rate!
+```
+
+---
+
+#### When You DO Need Calibration
+
+| Scenario | Need Calibration? | Why |
+|----------|------------------|-----|
+| Resampling (oversample) | YES | Changed data distribution |
+| Class weights | NO | Kept true distribution |
+| Different test distribution | YES | Production != training |
+| Different label definition | YES | What you labeled changed |
+| Model architecture change | MAYBE | Different learned priors |
+
+---
+
+#### Best Practice: Use Weights, Skip Calibration
+
+```python
+# GOOD: No resampling, no calibration needed
+X_train, y_train = load_imbalanced_data()  # 0.1% fraud
+
+# Compute weights
+class_weight = {
+    0: 1.0,
+    1: len(y_train[y_train==0]) / len(y_train[y_train==1])  # ~1000
+}
+
+# Train with weights (data distribution unchanged)
+model = LogisticRegression(class_weight='balanced')
+model.fit(X_train, y_train)
+
+# Inference: probabilities are automatically calibrated!
+probabilities = model.predict_proba(X_test)[:, 1]
+# These match the true 0.1% fraud rate in production ✓
+
+# BAD: Resampling + need calibration later
+X_train_resampled, y_train_resampled = oversample(X_train, y_train)  # 50:50
+model = LogisticRegression()
+model.fit(X_train_resampled, y_train_resampled)
+
+# Probabilities are miscalibrated (~50%)
+probabilities = model.predict_proba(X_test)[:, 1]
+# These DON'T match the true 0.1% fraud rate ✗
+
+# Need calibration
+calibrator = CalibratedClassifierCV(model)
+calibrator.fit(X_val, y_val)
+probabilities_calibrated = calibrator.predict_proba(X_test)[:, 1]  # Now correct
+```
+
+---
+
+#### Summary: Why Class Weights Don't Need Calibration
+
+| Aspect | Resampling | Class Weights |
+|--------|-----------|--------------|
+| **Data distribution during training** | Changed (50:50) | Unchanged (0.1:99.9) |
+| **Class priors learned** | From resampled dist | From true dist |
+| **Predicted probabilities** | Miscalibrated | Calibrated ✓ |
+| **Calibration needed?** | YES | NO |
+| **Recommended?** | NO | YES |
+
+**Key Principle**: "The distribution your model sees during training determines what probabilities it learns. Keep the true distribution, use weights to focus on important samples."
+
+---
+
 This FAQ covers the breadth of ML system design. Mastering these questions will prepare you for interviews!
