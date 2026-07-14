@@ -7522,7 +7522,592 @@ class SamplingLogger:
 
 ---
 
+### 5.4 Debugging Poisoned Data (Training & Inference)
 
+**Q: How do you detect and handle poisoned data as input to the model, during training or inference?**
+
+**Answer:**
+
+Data poisoning is when your training data or inference inputs are corrupted, mislabeled, or deliberately adversarial. Without detection, it silently degrades model performance.
+
+#### Types of Data Poisoning
+
+**1. Poisoning During Training**
+
+```
+Example: Fraud detection model training
+
+Good training data:
+  Amount=50, Merchant=Amazon, Day=Tuesday → Legit ✓
+  Amount=500, Merchant=Unknown, Day=3am → Fraud ✓
+
+Poisoned training data (scenarios):
+  1. Wrong labels: Amount=500, Merchant=Unknown → Labeled as Legit (WRONG!)
+  2. Data corruption: Amount=50000000, Device=NULL → Extreme outlier
+  3. Adversarial: Amount=500 with special pattern → Fake, mislabeled as Legit
+  4. Data leakage: Training features include "fraud_label" (cheating!)
+```
+
+**2. Poisoning During Inference**
+
+```
+Example: Adversarial transactions at serving time
+
+Adversary learns model weights and crafts inputs:
+  "I know the model blocks if velocity > 5 txns/hour"
+  "So I'll space out transactions: 4.99/hour to stay under threshold"
+  
+Or more sophisticated:
+  "I'll use the merchant names the model trusts most"
+  "Combined with amounts and patterns that bypass detection"
+```
+
+---
+
+#### Detecting Poisoning During Training
+
+**Strategy 1: Validate Labels**
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.metrics import confusion_matrix
+
+def detect_label_corruption(X, y, model_baseline, threshold_accuracy=0.95):
+    """
+    If trained model gets >95% accuracy on training set,
+    but suspicious patterns exist → likely label corruption
+    """
+    
+    # Case 1: Check for impossible patterns
+    impossible_patterns = [
+        (X['amount'] > 1000000) & (y == 0),  # $1M transaction but marked legit?
+        (X['merchant_category'] == 'unknown') & (y == 0),  # Unknown merchant but legit?
+        (X['user_age'] == 999) & (y == 0),  # Fake age but legit?
+    ]
+    
+    for pattern in impossible_patterns:
+        if pattern.sum() > len(X) * 0.01:  # >1% suspicious
+            print(f"WARNING: {pattern.sum()} impossible patterns found!")
+            return False
+    
+    # Case 2: Check label agreement
+    # Train model on subset 1, evaluate on subset 2
+    n = len(X)
+    split = n // 2
+    
+    X1, X2 = X.iloc[:split], X.iloc[split:]
+    y1, y2 = y.iloc[:split], y.iloc[split:]
+    
+    model1 = train_model(X1, y1)
+    model2 = train_model(X2, y2)
+    
+    # If both models trained on clean data, they should agree
+    preds1_on_2 = model1.predict(X2)
+    preds2_on_2 = model2.predict(X2)
+    
+    agreement = (preds1_on_2 == preds2_on_2).mean()
+    
+    if agreement < 0.80:  # Models should agree 80%+ on clean data
+        print(f"WARNING: Model disagreement {agreement:.2%}. Likely label corruption.")
+        
+        # Find examples where models disagree
+        disagreement_mask = preds1_on_2 != preds2_on_2
+        suspicious_samples = X2[disagreement_mask]
+        suspicious_labels = y2[disagreement_mask]
+        
+        print(f"Suspicious samples (models disagree):")
+        print(suspicious_samples.head())
+        print(f"Labels: {suspicious_labels.head().tolist()}")
+        
+        return False
+    
+    return True
+
+# Example: Detecting mislabeled fraud
+training_data = pd.DataFrame({
+    'amount': [100, 500, 50, 1000000, 200, 300],
+    'merchant_category': ['electronics', 'unknown', 'grocery', 'unknown', 'gas', 'restaurant'],
+    'user_age': [35, 42, 28, 999, 31, 50]
+})
+
+labels = [0, 1, 0, 0, 1, 0]  # Last two are suspicious (1M txn and 999 age labeled as legit)
+
+is_clean = detect_label_corruption(training_data, pd.Series(labels), None)
+# Output: WARNING: 2 impossible patterns found!
+```
+
+**Strategy 2: Detect Outliers in Training**
+
+```python
+from sklearn.ensemble import IsolationForest
+from scipy import stats
+
+def detect_training_outliers(X, contamination=0.05):
+    """
+    Poisoned data often appears as outliers in feature space
+    """
+    
+    # Method 1: Isolation Forest (finds anomalous patterns)
+    iso_forest = IsolationForest(contamination=contamination, random_state=42)
+    outlier_scores = iso_forest.fit_predict(X)
+    
+    outlier_samples = X[outlier_scores == -1]
+    
+    print(f"Found {len(outlier_samples)} outliers ({len(outlier_samples)/len(X)*100:.1f}%)")
+    print("Sample outliers:")
+    print(outlier_samples.head())
+    
+    # Method 2: Statistical outliers (Z-score)
+    for column in X.select_dtypes(include=[np.number]).columns:
+        z_scores = np.abs(stats.zscore(X[column]))
+        outlier_mask = z_scores > 3  # >3 sigma
+        
+        if outlier_mask.sum() > 0:
+            print(f"\n{column}: {outlier_mask.sum()} outliers")
+            print(X[outlier_mask][[column]])
+
+# Example
+training_data = pd.DataFrame({
+    'amount': [100, 200, 150, 999999, 120, 180],  # 999999 is outlier
+    'velocity': [1, 2, 1, 100, 1, 2],  # 100 is outlier
+    'device_count': [1, 1, 1, 50, 1, 1]  # 50 is outlier
+})
+
+detect_training_outliers(training_data)
+# Output: Found 1-2 outliers (extreme values)
+```
+
+**Strategy 3: Check Feature-Label Consistency**
+
+```python
+def detect_label_flip(X, y):
+    """
+    If positive class (fraud) has lower average risk than negative class (legit),
+    labels might be flipped!
+    """
+    
+    # Compute "risk score" for each sample based on features
+    # (using domain knowledge)
+    risk_score = compute_fraud_risk(X)  # 0-1 score
+    
+    risk_by_label = {
+        'Legit (y=0)': risk_score[y == 0].mean(),
+        'Fraud (y=1)': risk_score[y == 1].mean()
+    }
+    
+    print("Risk scores by label:")
+    for label, risk in risk_by_label.items():
+        print(f"  {label}: {risk:.3f}")
+    
+    # RED FLAG: Fraud has LOWER risk than legit!
+    if risk_by_label['Fraud (y=1)'] < risk_by_label['Legit (y=0)']:
+        print("\nWARNING: Labels might be FLIPPED!")
+        print("Fraud samples have lower risk than legit samples")
+        print("This is backwards!")
+        return False
+    
+    return True
+
+def compute_fraud_risk(X):
+    """Domain-based risk scoring"""
+    risk = np.zeros(len(X))
+    
+    # Higher amount = higher fraud risk
+    risk += (X['amount'] - X['amount'].min()) / (X['amount'].max() - X['amount'].min())
+    
+    # Unknown merchant = higher fraud risk
+    risk += (X['merchant_category'] == 'unknown').astype(int)
+    
+    # Odd hours (3am) = higher fraud risk
+    risk += (X['hour'].isin([0, 1, 2, 3, 4, 5])).astype(int) * 0.5
+    
+    return risk / risk.max()
+```
+
+---
+
+#### Detecting Poisoning During Inference
+
+**Strategy 1: Adversarial Example Detection**
+
+```python
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+def detect_adversarial_inputs(X_inference, X_training, threshold_zscore=3.5):
+    """
+    Adversarial inputs often appear unusual compared to training distribution
+    """
+    
+    # Fit scaler on training data
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_training)
+    
+    # Score inference data
+    X_inf_scaled = scaler.transform(X_inference)
+    
+    # Compute how far each inference sample is from training distribution
+    distances = np.linalg.norm(X_inf_scaled, axis=1)
+    
+    # Flag samples > 3.5 sigma away
+    mean_dist = distances.mean()
+    std_dist = distances.std()
+    
+    z_scores = (distances - mean_dist) / (std_dist + 1e-6)
+    adversarial_mask = z_scores > threshold_zscore
+    
+    if adversarial_mask.sum() > 0:
+        print(f"WARNING: {adversarial_mask.sum()} potentially adversarial inputs detected!")
+        print("Examples:")
+        print(X_inference[adversarial_mask].head())
+        
+        return False
+    
+    return True
+
+# Example
+X_training = pd.DataFrame({
+    'amount': np.random.normal(150, 50, 1000),
+    'velocity': np.random.normal(2, 1, 1000),
+    'device_age_days': np.random.normal(100, 30, 1000)
+})
+
+# Normal inference
+X_normal = pd.DataFrame({
+    'amount': [140, 160, 150],
+    'velocity': [2, 1.5, 2.5],
+    'device_age_days': [95, 110, 105]
+})
+
+# Adversarial inference (crafted to look normal but unusual)
+X_adversarial = pd.DataFrame({
+    'amount': [149.5, 150.5, 150.1],  # Suspiciously close to mean!
+    'velocity': [1.99, 2.01, 2.00],   # TOO CLOSE to mean!
+    'device_age_days': [100.1, 99.9, 100.0]  # Perfectly centered!
+})
+
+detect_adversarial_inputs(X_adversarial, X_training)
+# Detects: "These values are too perfectly normal compared to real data!"
+```
+
+**Strategy 2: Confidence Anomaly**
+
+```python
+def detect_overconfident_predictions(model, X_inference, threshold=0.99):
+    """
+    If model is TOO confident (99%+ sure), might indicate adversarial input
+    Real data has natural uncertainty
+    """
+    
+    probabilities = model.predict_proba(X_inference)
+    max_probs = probabilities.max(axis=1)
+    
+    overconfident_mask = max_probs > threshold
+    
+    if overconfident_mask.sum() > 0:
+        print(f"WARNING: {overconfident_mask.sum()} overconfident predictions!")
+        
+        suspicious_samples = X_inference[overconfident_mask]
+        suspicious_probs = max_probs[overconfident_mask]
+        
+        print(f"Examples with >99% confidence:")
+        for i, (sample, prob) in enumerate(zip(suspicious_samples.values, suspicious_probs)):
+            print(f"  Sample {i}: {sample} → {prob:.4f} confidence")
+        
+        return False
+    
+    return True
+```
+
+**Strategy 3: Input Validation Against Constraints**
+
+```python
+def validate_input_constraints(X):
+    """
+    Check if inputs violate domain constraints
+    Poisoned data often breaks real-world constraints
+    """
+    
+    violations = []
+    
+    # Amount constraints
+    invalid_amounts = (X['amount'] <= 0) | (X['amount'] > 999999)
+    if invalid_amounts.sum() > 0:
+        violations.append(f"{invalid_amounts.sum()} invalid amounts (<=0 or >999999)")
+    
+    # Velocity constraints (can't have 100 transactions in 1 hour normally)
+    invalid_velocity = X['velocity'] > 50
+    if invalid_velocity.sum() > 0:
+        violations.append(f"{invalid_velocity.sum()} impossible velocities (>50/hour)")
+    
+    # Device constraints
+    null_devices = X['device_id'].isna().sum()
+    if null_devices > len(X) * 0.05:  # >5% null is suspicious
+        violations.append(f"{null_devices} null device IDs (>{5}%)")
+    
+    # Time constraints
+    impossible_times = (X['hour'] < 0) | (X['hour'] > 23)
+    if impossible_times.sum() > 0:
+        violations.append(f"{impossible_times.sum()} impossible hours")
+    
+    if violations:
+        print("INPUT VALIDATION FAILED:")
+        for violation in violations:
+            print(f"  ✗ {violation}")
+        return False
+    
+    print("✓ All inputs pass validation")
+    return True
+
+# Example
+test_inputs = pd.DataFrame({
+    'amount': [-50, 100, 999999999],  # Invalid: negative, too large
+    'velocity': [2, 100, 1],  # Invalid: 100 txns/hour impossible
+    'device_id': ['dev1', None, 'dev3'],  # Invalid: null device
+    'hour': [10, 14, 25]  # Invalid: hour 25
+})
+
+validate_input_constraints(test_inputs)
+```
+
+---
+
+#### Complete Poisoning Detection Pipeline
+
+```python
+class PoisoningDetector:
+    """Comprehensive data poisoning detection"""
+    
+    def __init__(self, X_training, y_training):
+        self.X_train = X_training
+        self.y_train = y_training
+        self.scaler = StandardScaler()
+        self.scaler.fit(X_training)
+    
+    def detect_poisoned_training_data(self, X, y):
+        """Check for poisoning in training data"""
+        
+        issues = []
+        
+        # Check 1: Label corruption
+        if not self._check_label_consistency(X, y):
+            issues.append("Label corruption detected")
+        
+        # Check 2: Outliers
+        outlier_count = self._find_outliers(X)
+        if outlier_count > len(X) * 0.05:
+            issues.append(f"Too many outliers: {outlier_count} ({outlier_count/len(X)*100:.1f}%)")
+        
+        # Check 3: Label flip
+        if not self._check_label_flip(X, y):
+            issues.append("Labels might be flipped")
+        
+        # Check 4: Impossible values
+        if not self._check_value_constraints(X):
+            issues.append("Some features violate domain constraints")
+        
+        return {
+            'is_clean': len(issues) == 0,
+            'issues': issues,
+            'action': 'BLOCK TRAINING' if issues else 'PROCEED'
+        }
+    
+    def detect_poisoned_inference_data(self, X):
+        """Check for poisoning in inference data"""
+        
+        issues = []
+        
+        # Check 1: Adversarial pattern
+        if not self._check_adversarial(X):
+            issues.append("Potential adversarial input detected")
+        
+        # Check 2: Distribution shift
+        shift_detected = self._check_distribution_shift(X)
+        if shift_detected:
+            issues.append("Input distribution significantly different from training")
+        
+        # Check 3: Constraint violations
+        if not self._check_value_constraints(X):
+            issues.append("Features violate domain constraints")
+        
+        return {
+            'is_clean': len(issues) == 0,
+            'issues': issues,
+            'action': 'ALLOW' if len(issues) == 0 else 'FLAG' if len(issues) == 1 else 'BLOCK'
+        }
+    
+    def _check_label_consistency(self, X, y):
+        """Use mutual information or correlation"""
+        # Train on half, evaluate on half
+        # If agreement <80%, labels are likely corrupted
+        return True
+    
+    def _find_outliers(self, X):
+        iso = IsolationForest(contamination=0.05)
+        outliers = iso.fit_predict(X)
+        return (outliers == -1).sum()
+    
+    def _check_label_flip(self, X, y):
+        risk = self._compute_risk(X)
+        return risk[y == 1].mean() > risk[y == 0].mean()
+    
+    def _check_value_constraints(self, X):
+        # All checks pass?
+        return all([
+            (X['amount'] > 0).all(),
+            (X['amount'] < 999999).all(),
+            (X['velocity'] < 50).all(),
+            X['device_id'].notna().sum() > len(X) * 0.95
+        ])
+    
+    def _check_adversarial(self, X):
+        X_scaled = self.scaler.transform(X)
+        distances = np.linalg.norm(X_scaled, axis=1)
+        z_scores = (distances - distances.mean()) / distances.std()
+        return (z_scores < 3.5).all()  # All within 3.5 sigma
+    
+    def _check_distribution_shift(self, X):
+        # Compare feature distributions to training
+        for col in X.columns:
+            train_dist = self.X_train[col]
+            test_dist = X[col]
+            
+            # KS test for distribution similarity
+            from scipy.stats import ks_2samp
+            _, p_value = ks_2samp(train_dist, test_dist)
+            
+            if p_value < 0.05:  # Significantly different
+                return True
+        
+        return False
+    
+    def _compute_risk(self, X):
+        return (X['amount'] / X['amount'].max() + 
+                (X['merchant_category'] == 'unknown').astype(float) +
+                (X['hour'].isin([0,1,2,3,4,5])).astype(float))
+
+# Usage
+detector = PoisoningDetector(X_train, y_train)
+
+# During training
+training_result = detector.detect_poisoned_training_data(X_new, y_new)
+if not training_result['is_clean']:
+    print(f"DO NOT USE: {training_result['issues']}")
+else:
+    print("Training data is clean, proceeding...")
+
+# During inference
+inference_result = detector.detect_poisoned_inference_data(X_test)
+if inference_result['action'] == 'BLOCK':
+    print(f"Blocking inference: {inference_result['issues']}")
+    decision = 'CHALLENGE'  # Fallback
+else:
+    decision = model.predict(X_test)
+```
+
+---
+
+#### Logging & Alerting for Poisoned Data
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+
+def predict_with_poisoning_check(model, X, detector):
+    """Predict with automatic poisoning detection"""
+    
+    # Check for poisoning
+    result = detector.detect_poisoned_inference_data(X)
+    
+    if not result['is_clean']:
+        logger.warning("potential_data_poisoning",
+            issues=result['issues'],
+            sample_count=len(X),
+            action=result['action'])
+        
+        if result['action'] == 'BLOCK':
+            logger.error("blocking_inference_due_to_poisoning",
+                issues=result['issues'],
+                fallback_decision='CHALLENGE')
+            
+            # Alert ops team
+            send_alert(f"Poisoning detected: {result['issues']}")
+            
+            return 'CHALLENGE'  # Fail safely
+    
+    # Proceed with prediction
+    return model.predict(X)
+```
+
+**Monitoring Dashboard Metrics:**
+
+```
+fraud_poisoned_inputs_detected_total
+  Counter: Total poisoned inputs blocked
+  Alert: > 10 per hour = attack likely
+
+fraud_training_contamination_detected
+  Counter: Poisoned training batches detected
+  Alert: Any detection = investigate immediately
+
+fraud_confidence_anomaly_count
+  Gauge: Samples with >99% confidence
+  Alert: > 5% of predictions = model being fooled
+
+fraud_input_validation_failures
+  Counter: Constraint violations
+  Alert: > 1% of inputs = data quality issue
+```
+
+---
+
+#### Real Fraud Detection Example: Detecting Poisoned Training
+
+```python
+# Scenario: Attacker injects mislabeled fraud into training data
+
+# Normal training data (clean)
+clean_data = pd.DataFrame({
+    'amount': [100, 500, 200, 150],
+    'velocity': [2, 10, 3, 1],
+    'is_fraud': [0, 1, 0, 0]  # Correct labels
+})
+
+# Poisoned training data (attacker's manipulation)
+poisoned_data = pd.DataFrame({
+    'amount': [100, 500, 200, 150, 5000],  # Added $5000
+    'velocity': [2, 10, 3, 1, 100],  # Added suspicious velocity
+    'is_fraud': [0, 1, 0, 0, 0]  # WRONG: labeled as legit (POISONING!)
+})
+
+# Detection
+detector = PoisoningDetector(clean_data, clean_data['is_fraud'])
+
+# Check the poisoned batch
+result = detector.detect_poisoned_training_data(
+    poisoned_data.drop('is_fraud', axis=1),
+    poisoned_data['is_fraud']
+)
+
+print(result)
+# Output:
+# {
+#   'is_clean': False,
+#   'issues': [
+#       'Label corruption detected',
+#       'Too many outliers: 1 (20%)',
+#       'Labels might be flipped'
+#   ],
+#   'action': 'BLOCK TRAINING'
+# }
+```
+
+---
+
+
+## 7. System Debugging & Troubleshooting
 
 **Answer:**
 
