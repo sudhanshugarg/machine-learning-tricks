@@ -21,6 +21,7 @@ This is a **living FAQ** for [design.md](design.md) / [solution.md](solution.md)
 | 3 | 2026-07-13 | How exactly does the re-ranking cross-attention model work? What is cross-attention? | `[ANSWERED]` | Architecture / Math | [solution.md](solution.md) Step 4B |
 | 4 | 2026-07-13 | What is a ViT (Vision Transformer) encoder vs. a CNN encoder? How do they differ and which should I use? | `[ANSWERED]` | Terminology / Architecture | [solution.md](solution.md) Step 4A |
 | 5 | 2026-07-13 | What are "perception stack detections"? What information do they contain, and what do some concrete examples look like? | `[ANSWERED]` | Terminology | [solution.md](solution.md) Step 4A |
+| 6 | 2026-07-13 | In batch-based contrastive learning, how do we prevent true positives from being treated as negatives? What if two captions match the same video? | `[ANSWERED]` | Math / Architecture | [solution.md](solution.md) Step 4A |
 
 *(Append new rows as questions come in.)*
 
@@ -402,7 +403,133 @@ Video tokens: [v_1] [v_2] ... [v_n]  (n spatio-temporal patch tokens, frame 1..T
 
 ## Math
 
-*(No questions logged yet.)*
+### Q: In batch-based contrastive learning (CLIP), how do we prevent true positives from being treated as negatives? What if two different captions both match the same video? `[ANSWERED]`
+
+**A:**
+
+This is a real and important issue in contrastive learning — **in-batch negatives collision problem**. The CLIP loss (from the [[CLIP embedding question above]]) assumes that within a batch of $N$ pairs, only the diagonal $(i,i)$ entries are true positives, and all off-diagonal entries $(i, j), i \neq j$ are negatives. But what if caption $j$ *also* matches video $i$? Then the loss unfairly penalizes the model for aligning them, hurting embedding quality. Here's how to avoid this:
+
+### 1. Dataset Construction: One-to-One Pairing (Primary defense)
+
+The strongest fix is to **ensure each video appears in exactly one training example (row) with exactly one caption**. This makes the one-positive-per-row assumption true by design:
+
+```python
+# DON'T do this (creates collision risk):
+training_data = [
+    ('video_A.mp4', 'pedestrian crossing street'),
+    ('video_A.mp4', 'person jaywalking'),        # SAME video, DIFFERENT caption
+    ('video_B.mp4', '...'),
+]
+# If both captions match video_A, the second one will be penalized as a negative
+# for video_A's example.
+
+# DO this instead:
+training_data = [
+    ('video_A.mp4', 'pedestrian crossing street'),  # pick ONE canonical caption
+    ('video_A.mp4_v2.mp4', 'person jaywalking'),    # treat each (video, caption) as a distinct training instance
+    ('video_B.mp4', '...'),
+]
+# Each row is independent; no collisions.
+```
+
+For the driving-scene system (Step 4A), this means:
+- Each video clip gets **one auto-generated caption** from the perception-stack detections at a representative timestep in that clip.
+- If you have multiple **human-written captions** for the same clip (e.g., an engineer describes the same clip in multiple ways), you either pick one as canonical, or you create separate synthetic "clips" (same video, different windowing) for each caption.
+- A small number of high-value clips may have multiple curated captions — handle these as a separate batch (see Multi-Positive approach below) rather than mixing them with the main single-positive pipeline.
+
+### 2. Randomized Batching: Low-Probability Collision
+
+Even if your dataset *could* have duplicates, **randomizing which examples go into a batch together** makes collisions rare:
+- If video $A$ appears $m$ times in the dataset (with different captions), the probability that two of those instances end up in the same batch of size $N$ is $\approx O(m^2 / \text{total\_dataset\_size})$.
+- With careful filtering (see Deduplication below) to keep $m$ small, collisions become negligible even with randomized batching.
+
+### 3. Hard Negative Mining: Turn Duplicates into Useful Training Signal
+
+If you *do* have multiple captions for the same video, **flip the problem and use it as a hard negative signal**:
+
+```python
+# If you have:
+video_A = ('cyclist_swerving_into_lane.mp4',)
+caption_A1 = 'cyclist swerving into the lane'
+caption_A2 = 'cyclist riding straight in the bike lane'
+
+# Interpret this as:
+# - (video_A, caption_A1) is a positive pair
+# - (video_A, caption_A2) is a HARD NEGATIVE: a caption that sounds plausible
+#   but doesn't match the actual video
+# - Train the model to distinguish them
+
+# This forces the model to learn finer distinctions than it would with
+# easy negatives (completely unrelated captions).
+```
+
+In practice, if you had a clip of a cyclist actually swerving and also a caption claiming they were riding straight, the model learns that embeddings of "swerving" captions should *not* align with this video's embedding — a valuable signal, especially if one caption was a human mistake or an ambiguous scenario.
+
+### 4. Explicit Multi-Positive Handling
+
+Some systems explicitly handle multi-positive scenarios with a modified loss:
+
+$$\mathcal{L}_{\text{multi-positive}} = -\frac{1}{|P_i|} \sum_{p \in P_i} \log \frac{\exp(S_{ip}/\tau)}{\sum_{j=1}^N \exp(S_{ij}/\tau)}$$
+
+where $P_i$ is the set of all captions that match video $i$. If you have $k$ captions for video $i$, you sum over all $k$ of them as positives before the denominator (which sums over all $N$ items in the batch).
+
+However, this requires:
+- Explicit multi-positive labels in your training data (manual curation).
+- Careful batch construction (ensuring all positives for a video are in the same batch, or splitting the sum across batches).
+- For this system, overkill — the one-to-one design is simpler and works fine.
+
+### 5. Deduplication: Preprocess the Dataset
+
+Before training, scan for **near-duplicate** (video, caption) pairs:
+- Compute embeddings of all captions (using a pretrained text encoder).
+- Cosine-similar captions above a threshold (e.g., $> 0.95$) paired with the same or visually-similar videos get deduplicated (keep one, discard others).
+- This is a one-time preprocessing cost, preventing future collisions.
+
+### Concrete example: How the driving-scene system avoids it
+
+In Step 4A, captions are auto-generated from perception-stack detections:
+
+```python
+# For clip_00042.mp4, at timestamp t=5.2s:
+detections_t = [
+    {'agent_id': 'ped_5', 'class': 'pedestrian', 'position': [12, -2], ...},
+    {'agent_id': 'car_7', 'class': 'car', 'position': [25, 3], ...}
+]
+
+# Generate caption template:
+caption = f"Pedestrian on left ({12}m ahead), car on right ({25}m ahead)"
+# This caption is paired with clip_00042.mp4 exactly once in the training data.
+
+# A different clip, clip_00043.mp4, might have very similar detections
+# but a slightly different timestamp or scene, so it gets a different caption:
+caption_2 = f"Pedestrian on left ({11.8}m ahead), car on right ({25.1}m ahead)"
+
+# These are treated as separate training rows:
+training_data = [
+    ('clip_00042.mp4', 'Pedestrian on left (12m ahead), car on right (25m ahead)'),
+    ('clip_00043.mp4', 'Pedestrian on left (11.8m ahead), car on right (25.1m ahead)'),
+    ...
+]
+
+# Even though the captions are very similar, they're paired with different videos,
+# so there's no collision in the loss.
+```
+
+### Why larger batches still matter
+
+Even with no collisions, **batch size affects learning quality**:
+- A batch of size $N$ gives you $N-1$ in-batch negatives per positive.
+- Larger $N$ → more negatives to push apart → better-calibrated embeddings.
+- CLIP uses batches of 32K–128K across distributed replicas, not because of collisions, but because that scale of negatives helps the model learn a well-separated embedding space.
+- Trade-off: larger batches need more GPU memory and distributed training infrastructure.
+
+### Summary
+
+The main answer: **design the dataset so each video pairs with one canonical caption** (the fundamental assumption of CLIP-style in-batch negatives). Secondary defenses: randomized batching, hard-negative mining, deduplication, and explicit multi-positive losses for high-value cases. For the driving-scene system, the one-to-one design is natural (each clip gets one auto-generated caption) and sufficient.
+
+*Pointer:* [solution.md](solution.md), Step 4A "Multimodal Video/Text Embeddings" — Architecture: Dual/Multi-Tower Contrastive Embedding; [[CLIP embedding question above]].
+
+---
 
 ---
 
