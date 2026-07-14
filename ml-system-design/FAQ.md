@@ -4475,55 +4475,334 @@ Results:
 
 #### Key Concepts in Knowledge Distillation
 
-**1. Soft Targets (Knowledge Transfer)**
+**1. Understanding Distillation Weight vs Task Weight**
+
+The two weights control the contribution of each loss to the total loss:
 
 ```python
-# Hard targets: Binary (0 or 1)
-hard_label = [0, 1]  # Class 1
-
-# Soft targets from teacher: Probabilities (the "knowledge")
-teacher_soft = [0.05, 0.95]  # Very confident about class 1
-# Contains richer information than hard label!
-
-student_soft = [0.12, 0.88]  # Learns to match teacher distribution
-# Not perfect, but learns teacher's reasoning
+loss = distillation_weight * distillation_loss + task_weight * task_loss
 ```
 
-**2. Temperature Parameter**
+**Do they sum to 1.0?**
 
-Temperature controls how "soft" the probability distribution is:
+They don't HAVE to, but it's a common convention. If they sum to 1.0, it's a weighted average:
+
+```
+Common setups:
+
+Setup 1: Equal emphasis (sum = 1.0)
+  distillation_weight = 0.5
+  task_weight = 0.5
+  → Equally trust teacher knowledge and original labels
+
+Setup 2: More emphasis on distillation (sum = 1.0)
+  distillation_weight = 0.7
+  task_weight = 0.3
+  → Trust teacher more, use hard labels less (what we used)
+
+Setup 3: Heavy distillation emphasis (sum = 1.0)
+  distillation_weight = 0.9
+  task_weight = 0.1
+  → Almost pure knowledge transfer from teacher
+
+Setup 4: Unnormalized weights (don't sum to 1.0)
+  distillation_weight = 1.0
+  task_weight = 0.1
+  → Distillation loss contributes 10x more than task loss
+
+Setup 5: Only distillation (no hard labels)
+  distillation_weight = 1.0
+  task_weight = 0.0
+  → Pure knowledge transfer, ignore hard labels
+```
+
+**What's the effect?**
+
+```
+High distillation_weight (0.9+)
+  ✓ Student learns more from teacher patterns
+  ✓ Better generalization (teacher has "dark knowledge")
+  ✗ May overfit to teacher's mistakes
+  ✗ May ignore useful hard labels
+
+High task_weight (0.7+)
+  ✓ Student stays close to original task
+  ✓ Doesn't overfit to teacher's style
+  ✗ Less knowledge transfer from teacher
+  ✗ Student becomes more like training from scratch
+```
+
+**In practice:** Most papers use **0.7-0.9 distillation, 0.3-0.1 task**, with or without summing to 1.0.
+
+---
+
+**2. What is Distillation Loss Computing?**
+
+Distillation loss measures **how different the student's predictions are from the teacher's predictions**. It uses KL divergence (a measure of probability distribution difference).
+
+**Concrete Numerical Example:**
+
+```
+Suppose we have a 2-class classification problem (fraud/not-fraud)
+One test sample comes in:
+
+TEACHER OUTPUT (trained on lots of data):
+  logits = [2.5, 1.2]
+  soft_probs = softmax([2.5/3, 1.2/3])  # temperature=3
+            = softmax([0.83, 0.40])
+            = [0.65, 0.35]  ← Teacher is 65% confident it's fraud
+
+STUDENT OUTPUT (smaller, being trained):
+  logits = [1.8, 0.9]
+  soft_probs = softmax([1.8/3, 0.9/3])  # temperature=3
+             = softmax([0.60, 0.30])
+             = [0.58, 0.42]  ← Student is 58% confident it's fraud
+
+DISTILLATION LOSS: How different are [0.58, 0.42] from [0.65, 0.35]?
+```
+
+---
+
+**3. What is F.kl_div Doing?**
+
+`F.kl_div` computes **Kullback-Leibler (KL) divergence**, which measures the difference between two probability distributions.
+
+**Important:** F.kl_div has a specific signature:
+```python
+F.kl_div(input, target, reduction='batchmean')
+  input:  log-probabilities (output of log_softmax, not softmax!)
+  target: probabilities (output of softmax)
+```
+
+The formula it computes is:
+```
+KL(target || input) = sum(target * log(target / input))
+                    = sum(target * (log(target) - log(input)))
+```
+
+In our distillation context:
+```python
+# What we're computing:
+distillation_loss = F.kl_div(
+    F.log_softmax(student_logits / temperature, dim=1),  # input: log(student)
+    teacher_soft,                                         # target: teacher probs
+    reduction='batchmean'
+)
+
+# Expands to:
+KL = sum(teacher_soft * log(teacher_soft / student_soft))
+   = sum(teacher_soft * (log(teacher_soft) - log(student_soft)))
+```
+
+**Numerical Example of KL Divergence:**
+
+```
+Teacher soft = [0.65, 0.35]
+Student soft = [0.58, 0.42]
+
+KL divergence calculation:
+  = 0.65 * log(0.65 / 0.58) + 0.35 * log(0.35 / 0.42)
+  = 0.65 * log(1.12) + 0.35 * log(0.83)
+  = 0.65 * 0.113 + 0.35 * (-0.186)
+  = 0.073 - 0.065
+  = 0.008
+
+Interpretation:
+  KL = 0.008 = low divergence (student is close to teacher)
+  
+If student was very different:
+  Student soft = [0.2, 0.8]  (opposite prediction!)
+  KL = 0.65 * log(0.65/0.2) + 0.35 * log(0.35/0.8)
+     = 0.65 * log(3.25) + 0.35 * log(0.44)
+     = 0.65 * 1.18 + 0.35 * (-0.82)
+     = 0.767 - 0.287
+     = 0.480  ← high divergence (very different!)
+```
+
+**Key insight:** KL divergence is 0 when distributions are identical, and increases as they diverge.
+
+---
+
+**4. Why We Multiply by Temperature² in the Code**
+
+```python
+distillation_loss = F.kl_div(
+    F.log_softmax(student_logits / temperature, dim=1),
+    teacher_soft,
+    reduction='batchmean'
+) * (temperature ** 2)  # ← Why multiply by temperature²?
+```
+
+This is important for scaling! Here's why:
+
+```
+Temperature effect on soft targets:
+
+Temperature = 1.0:
+  probs = softmax([2.0, 1.0]) = [0.73, 0.27]
+  → Sharp distribution (high confidence)
+  → Small KL divergence values (harder to optimize)
+
+Temperature = 3.0:
+  probs = softmax([2.0/3, 1.0/3]) = [0.58, 0.42]
+  → Soft distribution (lower confidence)
+  → Smaller gradient values for KL divergence
+  → Harder to learn
+
+Temperature = 10.0:
+  probs = softmax([0.2, 0.1]) = [0.52, 0.48]
+  → Very soft distribution
+  → Even smaller gradients
+
+Solution: Multiply loss by temperature²
+  This re-scales the gradients so they're not too small
+  Ensures student actually learns from teacher
+```
+
+**With temperature scaling:**
+```
+KL loss at T=1:   0.008 (use as-is)
+KL loss at T=3:   0.002 (3x smaller)  → multiply by 3² = 9 → becomes 0.018 ✓
+KL loss at T=10:  0.0005 (20x smaller) → multiply by 10² = 100 → becomes 0.05 ✓
+```
+
+---
+
+**5. Full Loss Calculation Example (One Training Step)**
+
+```
+INPUTS:
+  batch_size = 32
+  temperature = 3.0
+  distillation_weight = 0.7
+  task_weight = 0.3
+  
+STEP 1: Forward pass
+  student_logits = model(X_batch)  # Shape: (32, 2)
+  
+STEP 2: Compute student soft targets
+  student_soft = softmax(student_logits / 3.0)  # Shape: (32, 2)
+  
+STEP 3: Get teacher predictions (no gradients)
+  with torch.no_grad():
+      teacher_logits = teacher_model(X_batch)
+      teacher_soft = softmax(teacher_logits / 3.0)
+  
+STEP 4: Compute distillation loss
+  student_log_soft = log_softmax(student_logits / 3.0)
+  distillation_loss = KL_div(student_log_soft, teacher_soft) * (3.0 ** 2)
+                    = 0.008 * 9 = 0.072
+  
+STEP 5: Compute task loss (with hard labels)
+  task_loss = cross_entropy(student_logits, y_batch)
+            = 0.125  (example value)
+  
+STEP 6: Combine losses
+  total_loss = 0.7 * 0.072 + 0.3 * 0.125
+             = 0.050 + 0.038
+             = 0.088
+  
+STEP 7: Backprop and update
+  total_loss.backward()
+  optimizer.step()
+```
+
+
+
+**6. Soft Targets (Knowledge Transfer)**
+
+Hard targets (one-hot labels) vs soft targets (probability distributions):
+
+```python
+# Hard target: Binary (0 or 1)
+hard_label = [0, 1]  # Class 1 (certain)
+
+# Soft target from teacher: Probability distribution (nuanced knowledge)
+teacher_soft = [0.05, 0.95]  # 5% class 0, 95% class 1
+# The 5% for wrong class is "dark knowledge" — tells student
+# the teacher thinks class 0 is slightly plausible
+
+student_soft = [0.12, 0.88]  # Learns to match teacher's reasoning
+# Student doesn't just learn "class 1", but ALSO learns that
+# class 0 is somewhat plausible (from the 12%)
+```
+
+**Why soft targets matter:** Hard labels only say "correct" or "wrong". Soft targets reveal *how confident* the teacher is about wrong classes — this is "dark knowledge" that helps the student generalize better.
+
+**7. Temperature Parameter Effects**
+
+Temperature softens the probability distribution, revealing more structure:
 
 ```python
 logits = [2.0, 1.0]
 
-# Temperature = 1.0 (no softening)
-probs = softmax([2.0, 1.0]) = [0.73, 0.27]  ← Sharp, very confident
+# Temperature = 1.0 (no softening, standard)
+probs = softmax([2.0, 1.0]) = [0.73, 0.27]
+→ Sharp distribution (teacher very confident)
+→ Little information about wrong class
 
 # Temperature = 3.0 (soft targets)
-probs = softmax([2.0/3, 1.0/3]) = [0.58, 0.42]  ← Soft, less confident
+probs = softmax([2.0/3, 1.0/3]) = softmax([0.67, 0.33]) = [0.58, 0.42]
+→ Softer distribution (less confident)
+→ 42% for wrong class reveals more "dark knowledge"
 
 # Temperature = 10.0 (very soft)
-probs = softmax([2.0/10, 1.0/10]) = [0.52, 0.48]  ← Almost uniform
+probs = softmax([0.2, 0.1]) = [0.52, 0.48]
+→ Nearly uniform (very soft)
+→ Almost equal confidence on both classes
+→ Maximum information about relative plausibility
 ```
 
-Higher temperature = softer targets = more information about wrong classes (the "dark knowledge").
-
-**3. Distillation Loss**
-
+**Tradeoff:**
 ```
-Total Loss = α * Distillation Loss + (1-α) * Task Loss
+Higher temperature (softer targets):
+  ✓ More information about wrong classes
+  ✓ Student learns richer patterns
+  ✗ Distribution becomes too uniform (loses signal)
+  ✗ Typical range: 3.0 to 20.0
 
-where:
-  Distillation Loss = KL_divergence(student_soft, teacher_soft)
-  Task Loss = Cross_entropy(student_logits, hard_labels)
-  α = weight (typically 0.5 to 0.9)
+Lower temperature (sharper targets):
+  ✓ Preserves strong signals
+  ✗ Little info about wrong classes
+  ✗ Less "dark knowledge"
+  ✗ Typical: 1.0 (normal softmax)
 ```
 
-Why combine both?
-- **Distillation loss** teaches student from teacher's knowledge
-- **Task loss** prevents student from drifting away from original labels
+Common practice: **Temperature = 3.0 to 5.0** balances information with signal preservation.
 
-**4. When Distillation Works Best**
+**8. When to Use Which Weights**
+
+```python
+# If you want mostly knowledge transfer:
+distillation_weight = 0.9
+task_weight = 0.1
+→ Student learns from teacher 90%, original labels 10%
+→ Best for: Teacher is very good, labels are noisy
+
+# Balanced approach:
+distillation_weight = 0.7
+task_weight = 0.3
+→ Student learns from both equally
+→ Best for: General purpose, good teacher and clean labels
+
+# If you want to keep task performance:
+distillation_weight = 0.5
+task_weight = 0.5
+→ 50-50 split
+→ Best for: Can't trust teacher entirely
+
+# Pure knowledge transfer (advanced):
+distillation_weight = 1.0
+task_weight = 0.0
+→ Only use teacher, ignore hard labels
+→ Risky but can work if teacher is excellent
+```
+
+**Rule of thumb:** Start with 0.7/0.3, adjust based on validation accuracy.
+
+---
+
+**9. When Distillation Works Best**
 
 ```
 ✓ Works well when:
@@ -4539,7 +4818,7 @@ Why combine both?
   └─ Student architecture is too small to learn
 ```
 
-**5. Distillation vs Other Compression Techniques**
+**10. Distillation vs Other Compression Techniques**
 
 ```
 Technique              | Size | Speed | Accuracy | Difficulty
