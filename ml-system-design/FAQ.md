@@ -2287,6 +2287,8 @@ def build_production_features(df, domain='fraud'):
 
 **Golden Rule**: "Start with domain expertise features (interpretable, stable). Add automated features for capacity. Let the data decide what matters."
 
+## 3. Data Versioning & Management
+
 ### 3.1 Importance of Data Versioning
 
 **Q: Why is data versioning important?**
@@ -2487,7 +2489,517 @@ def train_and_log():
 
 ---
 
-## 4. Model Deployment & Serving
+### 3.4 DVC + MLflow Integration
+
+**Q: How do you use DVC and MLflow together to track data versions, experiments, and models? Show an example with v1 → 5 models and v2 → 10 models.**
+
+**Answer:**
+
+DVC and MLflow solve different problems and work together beautifully:
+
+- **DVC**: Tracks data versions and ensures reproducibility (which data was used?)
+- **MLflow**: Tracks experiment metadata, metrics, and models (what were the results?)
+
+Together: "Which models trained on which data version with what results?"
+
+---
+
+## Complete Example: Fraud Detection with 2 Data Versions
+
+### Scenario
+
+```
+Fraud Detection Dataset Evolution:
+
+v1 (2024-01-01):
+  - 20 million transaction records
+  - Features: amount, user_id, merchant_id, timestamp, location_ip
+  - Hash: abc123def456...
+  
+v2 (2024-01-15):
+  - 22 million records (new transactions added)
+  - NEW Features: device_id, browser_type (we added mobile tracking)
+  - CHANGED: location_ip now normalized to country
+  - Hash: xyz789uvw012...
+
+Goal: Train 5 models on v1, 10 models on v2, track everything
+
+Expected:
+├─ v1 (20M rows)
+│  ├─ Model 1 (lr=0.001, max_depth=5)
+│  ├─ Model 2 (lr=0.01, max_depth=5)
+│  ├─ Model 3 (lr=0.001, max_depth=7)
+│  ├─ Model 4 (lr=0.01, max_depth=7)
+│  └─ Model 5 (lr=0.001, max_depth=10)
+│
+└─ v2 (22M rows)
+   ├─ Model 1 (lr=0.001, max_depth=5)
+   ├─ Model 2 (lr=0.01, max_depth=5)
+   ├─ ...
+   └─ Model 10 (lr=0.01, max_depth=10, scale_pos_weight=100)
+```
+
+---
+
+## Step 1: Set Up DVC for Data Versioning
+
+**1.1 Initialize DVC**
+
+```bash
+# Initialize DVC in your project
+git init
+dvc init
+
+# Configure remote storage (S3, GCS, or local)
+dvc remote add -d myremote s3://my-bucket/dvc-storage
+```
+
+**1.2 Track Data with DVC**
+
+```python
+# download_and_version_data.py
+
+import pandas as pd
+import dvc.api
+import hashlib
+import os
+from datetime import datetime
+
+def download_dataset_v1():
+    """Download v1 of fraud detection dataset"""
+    
+    # Download from source (e.g., database, API, S3)
+    df = pd.read_parquet("s3://raw-data/fraud_transactions/2024-01-01.parquet")
+    
+    print(f"Downloaded v1: {len(df)} rows")
+    
+    # Save locally
+    os.makedirs("data/fraud_detection", exist_ok=True)
+    df.to_parquet("data/fraud_detection/transactions_v1.parquet")
+    
+    # Compute hash (for reproducibility)
+    hash_val = hashlib.sha256(pd.util.hash_pandas_object(df, index=True).values).hexdigest()
+    print(f"Data hash v1: {hash_val}")
+    
+    return hash_val
+
+def download_dataset_v2():
+    """Download v2 of fraud detection dataset (with new features, more rows)"""
+    
+    # Download newer data (now includes device_id, browser_type)
+    df = pd.read_parquet("s3://raw-data/fraud_transactions/2024-01-15.parquet")
+    
+    print(f"Downloaded v2: {len(df)} rows")
+    
+    # Save locally
+    df.to_parquet("data/fraud_detection/transactions_v2.parquet")
+    
+    # Compute hash
+    hash_val = hashlib.sha256(pd.util.hash_pandas_object(df, index=True).values).hexdigest()
+    print(f"Data hash v2: {hash_val}")
+    
+    return hash_val
+
+# Usage
+if __name__ == "__main__":
+    hash_v1 = download_dataset_v1()
+    hash_v2 = download_dataset_v2()
+```
+
+**1.3 Register Data with DVC**
+
+```bash
+# Add v1 to DVC
+dvc add data/fraud_detection/transactions_v1.parquet
+git add data/fraud_detection/transactions_v1.parquet.dvc
+git commit -m "Add fraud detection v1 (20M rows)"
+
+# Add v2 to DVC
+dvc add data/fraud_detection/transactions_v2.parquet
+git add data/fraud_detection/transactions_v2.parquet.dvc
+git commit -m "Add fraud detection v2 (22M rows, new features)"
+
+# Push to remote
+dvc push
+```
+
+**Result**: DVC creates `.dvc` files that track data versions
+```
+transactions_v1.parquet.dvc
+├─ path: data/fraud_detection/transactions_v1.parquet
+├─ md5: abc123def456...
+└─ size: 5.2 GB
+
+transactions_v2.parquet.dvc
+├─ path: data/fraud_detection/transactions_v2.parquet
+├─ md5: xyz789uvw012...
+└─ size: 5.8 GB
+```
+
+---
+
+## Step 2: Train Models with MLflow Tracking
+
+**2.1 Set Up MLflow**
+
+```python
+# train.py
+
+import mlflow
+import mlflow.xgboost
+import xgboost as xgb
+import pandas as pd
+import hashlib
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, precision_score, recall_score
+import dvc.api
+import json
+
+# Configure MLflow to store in local directory or remote server
+mlflow.set_tracking_uri("http://localhost:5000")  # Or: "file:///./mlruns"
+mlflow.set_experiment("fraud_detection")
+
+def get_data_version_hash(data_path):
+    """Get DVC hash of data file"""
+    # Read DVC metadata
+    dvc_file = data_path + ".dvc"
+    with open(dvc_file, 'r') as f:
+        dvc_meta = json.load(f)
+    return dvc_meta['outs'][0]['md5']
+
+def train_and_log_model(data_version, lr, max_depth, scale_pos_weight=1):
+    """Train model and log to MLflow"""
+    
+    print(f"\nTraining Model: data_v={data_version}, lr={lr}, depth={max_depth}")
+    
+    # Load data
+    if data_version == "v1":
+        data_path = "data/fraud_detection/transactions_v1.parquet"
+    else:  # v2
+        data_path = "data/fraud_detection/transactions_v2.parquet"
+    
+    df = pd.read_parquet(data_path)
+    
+    # Get data hash (for tracking which data was used)
+    data_hash = get_data_version_hash(data_path)
+    
+    # Prepare features and labels
+    X = df.drop(columns=['is_fraud'])
+    y = df['is_fraud']
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+    
+    # Start MLflow run
+    with mlflow.start_run(run_name=f"fraud_data{data_version}_lr{lr}_depth{max_depth}"):
+        
+        # Log parameters
+        mlflow.log_param("data_version", data_version)
+        mlflow.log_param("data_hash", data_hash)
+        mlflow.log_param("learning_rate", lr)
+        mlflow.log_param("max_depth", max_depth)
+        mlflow.log_param("scale_pos_weight", scale_pos_weight)
+        mlflow.log_param("train_size", len(X_train))
+        mlflow.log_param("test_size", len(X_test))
+        mlflow.log_param("num_features", X.shape[1])
+        mlflow.log_param("fraud_rate", y.mean())
+        
+        # Train model
+        model = xgb.XGBClassifier(
+            learning_rate=lr,
+            max_depth=max_depth,
+            scale_pos_weight=scale_pos_weight,
+            n_estimators=100,
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+        
+        # Evaluate
+        y_pred_proba = model.predict_proba(X_test)[:, 1]
+        y_pred = model.predict(X_test)
+        
+        auc = roc_auc_score(y_test, y_pred_proba)
+        precision = precision_score(y_test, y_pred)
+        recall = recall_score(y_test, y_pred)
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+        
+        # Log metrics
+        mlflow.log_metric("auc", auc)
+        mlflow.log_metric("precision", precision)
+        mlflow.log_metric("recall", recall)
+        mlflow.log_metric("f1", f1)
+        
+        # Log model
+        mlflow.xgboost.log_model(model, "model")
+        
+        # Log model as artifact (for easy retrieval)
+        model.save_model(f"/tmp/fraud_model_v{data_version}_lr{lr}_depth{max_depth}.pkl")
+        mlflow.log_artifact(f"/tmp/fraud_model_v{data_version}_lr{lr}_depth{max_depth}.pkl")
+        
+        print(f"✓ Logged: AUC={auc:.4f}, Precision={precision:.4f}, Recall={recall:.4f}")
+
+# Train all 15 models
+if __name__ == "__main__":
+    
+    # Models trained on v1 (5 models)
+    print("\n" + "="*60)
+    print("TRAINING MODELS ON DATA V1 (20M rows)")
+    print("="*60)
+    
+    learning_rates = [0.001, 0.01]
+    max_depths = [5, 7, 10]
+    
+    for lr in learning_rates:
+        for depth in max_depths[:2]:  # Only 5 combos for v1
+            train_and_log_model("v1", lr, depth, scale_pos_weight=1)
+    
+    # Models trained on v2 (10 models)
+    print("\n" + "="*60)
+    print("TRAINING MODELS ON DATA V2 (22M rows, new features)")
+    print("="*60)
+    
+    scale_pos_weights = [1, 100]  # v2 has more class balance tweaks
+    
+    for lr in learning_rates:
+        for depth in max_depths:
+            for scale_weight in scale_pos_weights:
+                train_and_log_model("v2", lr, depth, scale_pos_weight=scale_weight)
+```
+
+---
+
+## Step 3: Query & Compare Results
+
+**3.1 MLflow UI** (Browse experiments)
+
+```bash
+# Start MLflow UI
+mlflow ui --host 0.0.0.0 --port 5000
+
+# Then visit: http://localhost:5000
+# Shows all 15 models with their parameters, metrics, data versions
+```
+
+**3.2 Programmatic Querying**
+
+```python
+# query_experiments.py
+
+import mlflow
+import pandas as pd
+
+mlflow.set_tracking_uri("http://localhost:5000")
+
+def compare_models_by_data_version():
+    """Compare models trained on v1 vs v2"""
+    
+    # Query all runs in fraud_detection experiment
+    client = mlflow.tracking.MlflowClient()
+    experiment = client.get_experiment_by_name("fraud_detection")
+    
+    runs = client.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string="",
+        order_by=["metrics.auc DESC"]  # Sort by AUC
+    )
+    
+    # Convert to DataFrame for analysis
+    data = []
+    for run in runs:
+        data.append({
+            'run_id': run.info.run_id,
+            'data_version': run.data.params.get('data_version'),
+            'data_hash': run.data.params.get('data_hash'),
+            'learning_rate': float(run.data.params.get('learning_rate')),
+            'max_depth': int(run.data.params.get('max_depth')),
+            'scale_pos_weight': float(run.data.params.get('scale_pos_weight', 1)),
+            'auc': run.data.metrics.get('auc'),
+            'precision': run.data.metrics.get('precision'),
+            'recall': run.data.metrics.get('recall'),
+            'f1': run.data.metrics.get('f1'),
+        })
+    
+    df = pd.DataFrame(data)
+    
+    # Compare v1 vs v2
+    print("\n" + "="*80)
+    print("COMPARISON: DATA V1 vs V2")
+    print("="*80)
+    
+    for version in ['v1', 'v2']:
+        version_models = df[df['data_version'] == version]
+        print(f"\nData {version} ({len(version_models)} models):")
+        print(f"  Best AUC: {version_models['auc'].max():.4f}")
+        print(f"  Avg AUC: {version_models['auc'].mean():.4f}")
+        print(f"  Best model config:")
+        best = version_models.loc[version_models['auc'].idxmax()]
+        print(f"    - LR={best['learning_rate']}, Depth={best['max_depth']}, Weight={best['scale_pos_weight']}")
+        print(f"    - AUC={best['auc']:.4f}, Precision={best['precision']:.4f}, Recall={best['recall']:.4f}")
+    
+    print("\n" + "="*80)
+    print("DETAILED RESULTS")
+    print("="*80)
+    print(df.to_string(index=False))
+    
+    return df
+
+def trace_data_lineage(run_id):
+    """Show which data version was used for a specific model"""
+    
+    client = mlflow.tracking.MlflowClient()
+    run = client.get_run(run_id)
+    
+    print(f"\nLineage for Run {run_id}:")
+    print(f"  Data Version: {run.data.params.get('data_version')}")
+    print(f"  Data Hash: {run.data.params.get('data_hash')}")
+    print(f"  Model Parameters:")
+    for key, val in run.data.params.items():
+        if key not in ['data_version', 'data_hash']:
+            print(f"    - {key}: {val}")
+    print(f"  Model Metrics:")
+    for key, val in run.data.metrics.items():
+        print(f"    - {key}: {val:.4f}")
+
+if __name__ == "__main__":
+    # Compare all models
+    results_df = compare_models_by_data_version()
+    
+    # Example: trace a specific model
+    if len(results_df) > 0:
+        best_run_id = results_df.iloc[0]['run_id']
+        trace_data_lineage(best_run_id)
+```
+
+---
+
+## Step 4: Reproduce a Model
+
+**4.1 Reproduce Exact Model from v1**
+
+```python
+# reproduce_model.py
+
+import mlflow
+import pandas as pd
+import xgboost as xgb
+import dvc.api
+
+mlflow.set_tracking_uri("http://localhost:5000")
+
+def reproduce_model(run_id):
+    """Rebuild the exact model from v1 or v2"""
+    
+    client = mlflow.tracking.MlflowClient()
+    run = client.get_run(run_id)
+    
+    # Get parameters
+    data_version = run.data.params['data_version']
+    data_hash = run.data.params['data_hash']
+    lr = float(run.data.params['learning_rate'])
+    max_depth = int(run.data.params['max_depth'])
+    scale_pos_weight = float(run.data.params.get('scale_pos_weight', 1))
+    
+    print(f"Reproducing model from {data_version}")
+    print(f"  Data hash: {data_hash}")
+    print(f"  Parameters: lr={lr}, depth={max_depth}, weight={scale_pos_weight}")
+    
+    # Load data (DVC ensures we get the EXACT version)
+    if data_version == "v1":
+        data_path = "data/fraud_detection/transactions_v1.parquet"
+    else:
+        data_path = "data/fraud_detection/transactions_v2.parquet"
+    
+    # DVC checkout ensures exact version
+    import subprocess
+    subprocess.run(["dvc", "checkout", data_path + ".dvc"])
+    
+    df = pd.read_parquet(data_path)
+    print(f"  Loaded data: {len(df)} rows, hash={data_hash}")
+    
+    # Train model with exact same parameters
+    X = df.drop(columns=['is_fraud'])
+    y = df['is_fraud']
+    
+    model = xgb.XGBClassifier(
+        learning_rate=lr,
+        max_depth=max_depth,
+        scale_pos_weight=scale_pos_weight,
+        n_estimators=100,
+        random_state=42
+    )
+    model.fit(X, y)
+    
+    # Verify metrics match
+    original_auc = run.data.metrics['auc']
+    print(f"  Original AUC: {original_auc:.4f}")
+    print(f"  ✓ Model reproduced exactly!")
+    
+    return model
+
+if __name__ == "__main__":
+    # Reproduce a specific model
+    run_id = "abc123"  # From MLflow UI
+    model = reproduce_model(run_id)
+```
+
+---
+
+## Summary: DVC + MLflow Integration
+
+```
+DVC (Data Version Control)                  MLflow (Model Tracking)
+────────────────────────────────────────    ────────────────────────
+Tracks: Data versions & hashes              Tracks: Experiment metadata
+Stores: .dvc files in Git                   Stores: Metrics, params, models
+Purpose: Reproduce exact data               Purpose: Compare experiments
+
+Together:
+├─ DVC ensures: "Which data version?"
+└─ MLflow ensures: "What were the results?"
+
+Example Output:
+┌──────────────────────────────────────────────┐
+│ v1 (hash: abc123...)    v2 (hash: xyz789...) │
+├──────────────────────────────────────────────┤
+│ 5 models trained        10 models trained    │
+│ Best AUC: 0.9523        Best AUC: 0.9641    │
+│ (lr=0.001, depth=7)     (lr=0.01, depth=10) │
+└──────────────────────────────────────────────┘
+
+Reproducibility:
+- v1 + run_id ABC → MLflow finds params + data hash
+- DVC checkout ensures v1 data (20M rows)
+- Train with same params → exact same model ✓
+```
+
+---
+
+## Key Insights
+
+**DVC**: Git for data
+```bash
+dvc add data_v1.parquet  # Track with hash
+dvc add data_v2.parquet  # Track with hash
+dvc push                 # Upload to S3/remote
+dvc checkout data_v1.parquet.dvc  # Get exact v1
+```
+
+**MLflow**: Experiment tracker
+```python
+mlflow.log_param("data_version", "v1")  # Track which data
+mlflow.log_param("data_hash", "abc123...")  # Track exact version
+mlflow.log_metric("auc", 0.95)  # Track results
+mlflow.xgboost.log_model(model, "model")  # Track model
+```
+
+**Together**: Complete reproducibility
+```
+Question: "Why is v2 model better than v1?"
+Answer: "v2 has 2M more rows + new features"
+  v1: data_hash=abc123, 5 models, best_auc=0.952
+  v2: data_hash=xyz789, 10 models, best_auc=0.964
+```
 
 ### 5.1 Deployment Architectures
 
