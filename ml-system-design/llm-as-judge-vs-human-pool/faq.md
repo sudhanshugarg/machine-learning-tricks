@@ -1,5 +1,23 @@
 # FAQ: Evaluation System with Human + LLM Evaluators
 
+## Quick Navigation
+
+**By Category:**
+- [LLM Calibration](#llm-calibration)
+- [Routing Strategy](#routing-strategy)
+- [Score Aggregation & Consensus](#score-aggregation--consensus)
+- [Evaluation & Metrics](#evaluation--metrics)
+
+**All Questions:**
+1. [Why calibrate confidence instead of the score itself?](#q-why-calibrate-confidence-instead-of-the-score-itself-how-do-you-actually-collect-calibration-data-answered)
+2. [How does the initial confidence get computed?](#q-how-does-the-initial-confidence-get-computed-when-does-the-llm-judge-run-answered)
+3. [If LLM gave 0.5 confidence and human gave 0.9, what's the final confidence?](#q-if-llm-gave-05-confidence-and-human-gave-09-whats-the-final-confidence-sent-to-the-user-answered)
+4. [How do you compute Spearman's correlation coefficient?](#q-how-do-you-compute-spearmans-correlation-coefficient-answered)
+5. [Why is there a 6 in the Spearman formula?](#q-why-is-there-a-6-in-the-spearman-formula-answered)
+6. [When would I use Platt scaling vs isotonic regression?](#q-when-would-i-use-platt-scaling-vs-isotonic-regression-for-calibration-answered)
+
+---
+
 ## Question Log
 
 | Date | Category | Question | Status |
