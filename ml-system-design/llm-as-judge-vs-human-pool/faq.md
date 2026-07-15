@@ -6,6 +6,7 @@
 |------|----------|----------|--------|
 | 2026-07-14 | LLM Calibration | Why calibrate confidence (not score)? How do you group calibration data? | [ANSWERED] |
 | 2026-07-14 | Evaluation & Metrics | How do you compute Spearman's correlation coefficient? | [ANSWERED] |
+| 2026-07-14 | Evaluation & Metrics | Why is there a 6 in the Spearman formula? | [ANSWERED] |
 
 ---
 
@@ -170,3 +171,87 @@ if rho < 0.85:
 This is tracked in the [solution.md](solution.md) quarterly recalibration loop (Section 6.2).
 
 *Pointer:* [solution.md](solution.md), Section 6.1 "Quality Metrics" and Section 6.2 "Quarterly Recalibration"
+
+#### Q: Why is there a 6 in the Spearman formula? `[ANSWERED]`
+
+**A:**
+
+The formula is:
+```
+ρ = 1 - (6 × Σ(d²)) / (n(n²-1))
+```
+
+The **6 comes from algebra**. Here's why:
+
+**Spearman's ρ is Pearson's correlation applied to ranks.** 
+
+Pearson's general formula is:
+```
+r = Σ((x - mean_x)(y - mean_y)) / sqrt(Σ(x - mean_x)² × Σ(y - mean_y)²)
+```
+
+But when you apply this to **ranks** (which are always 1, 2, 3, ..., n), something special happens:
+
+1. **The mean of ranks is always (n+1)/2**
+   - For n=5: mean = 3
+   - For n=100: mean = 50.5
+
+2. **The sum of squared deviations from mean is always n(n²-1)/12**
+   - For n=5: Σ(rank - 3)² = 5(25-1)/12 = 10
+
+3. **When you substitute these into Pearson's formula and simplify the algebra, the 6 falls out naturally.**
+
+**Where does 6 come from mathematically?**
+
+Through algebraic manipulation:
+```
+Pearson on ranks:
+r = [numerator] / [n(n²-1)/12]
+
+Rearranging:
+ρ = 1 - (6 × Σ(d²)) / (n(n²-1))
+```
+
+The 6 = 2 × 3 emerges from the specific form of this simplification. It's not arbitrary—it's what the math produces when you specialize Pearson's formula to ranks.
+
+**Concrete example:**
+
+```
+n = 5 items
+Σ(d²) = 2 (rank differences squared)
+
+ρ = 1 - (6 × 2) / (5 × (25 - 1))
+  = 1 - 12 / 120
+  = 1 - 0.10
+  = 0.90
+
+(If 6 weren't there, you'd get the wrong answer!)
+```
+
+**Why use this formula?**
+
+It's a **shortcut formula** specific to ranks. Instead of computing full Pearson correlation (means, standard deviations, etc.), you can:
+1. Compute rank differences (d)
+2. Square and sum them
+3. Plug into one formula
+
+**Much faster than Pearson from scratch.**
+
+**When does this formula NOT work?**
+
+Only when **there are tied rankings**. Example:
+- Two items both score 4 → they'd both get rank 2.5 (average of 2 and 3)
+- The formula above assumes no ties
+
+In that case, you need to use **Pearson correlation on the ranks** directly. 
+
+That's why `scipy.spearmanr()` is smart—it detects ties and auto-adjusts:
+```python
+from scipy.stats import spearmanr
+
+llm_scores = [5, 4, 4, 3, 1]    # two 4's (tied)
+human_scores = [5, 3, 4, 2, 1]
+
+rho, p_value = spearmanr(llm_scores, human_scores)
+# scipy handles the tie automatically
+```
