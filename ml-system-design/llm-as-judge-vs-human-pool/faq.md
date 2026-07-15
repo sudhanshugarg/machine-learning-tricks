@@ -16,6 +16,7 @@
 5. [Why is there a 6 in the Spearman formula?](#q-why-is-there-a-6-in-the-spearman-formula-answered)
 6. [When would I use Platt scaling vs isotonic regression?](#q-when-would-i-use-platt-scaling-vs-isotonic-regression-for-calibration-answered)
 7. [Can you walk me through isotonic regression with a concrete example?](#q-can-you-walk-me-through-isotonic-regression-with-a-concrete-example-answered)
+8. [What are BLEU and ROUGE scores, and when would you use them instead of LLM judging?](#q-what-are-bleu-and-rouge-scores-and-when-would-you-use-them-instead-of-llm-judging-answered)
 
 ---
 
@@ -30,6 +31,7 @@
 | 2026-07-14 | Score Aggregation | If LLM gave 0.5 confidence and human gave 0.9, what's the final confidence? | [ANSWERED] |
 | 2026-07-14 | LLM Calibration | When would I use Platt scaling vs isotonic regression? | [ANSWERED] |
 | 2026-07-14 | LLM Calibration | Can you walk me through isotonic regression with a concrete example? | [ANSWERED] |
+| 2026-07-15 | Evaluation & Metrics | What are BLEU and ROUGE scores? When use instead of LLM judge? | [ANSWERED] |
 
 ---
 
@@ -736,6 +738,250 @@ else:
 For this evaluation system: **Start with Platt, monitor quarterly, switch to isotonic if calibration error degrades.**
 
 *Pointer:* [solution.md](solution.md), Section 2.3 "Confidence Calibration via Platt Scaling"
+
+#### Q: What are BLEU and ROUGE scores, and when would you use them instead of LLM judging? `[ANSWERED]`
+
+**A:** BLEU and ROUGE are **reference-based automatic evaluation metrics** — they compare a generated text (e.g., LLM output) against a reference text (e.g., human gold standard) using n-gram overlap. They're fast, deterministic, and cost-free, but limited to tasks where a single "correct answer" exists.
+
+---
+
+## BLEU Score (Bilingual Evaluation Understudy)
+
+**What it is:** Measures n-gram precision — how many n-grams in the generated text appear in the reference text.
+
+**Formula:**
+```
+BLEU = BP × exp(Σ w_n log(p_n))
+
+where:
+  BP = brevity penalty (penalizes short outputs)
+  p_n = precision of n-grams of size n
+  w_n = weight for n-gram size (typically 0.25 for each of 1-4)
+```
+
+**Example:**
+
+```
+Reference (gold standard):
+  "The quick brown fox jumps over the lazy dog"
+
+Generated (LLM output):
+  "The quick brown fox jumps over a lazy dog"
+
+N-gram overlap:
+  Unigrams (1-word):   "The", "quick", "brown", "fox", "jumps", "over", "lazy", "dog"
+                       → 8/9 = 89% match
+  Bigrams (2-word):    "The quick", "brown fox", "fox jumps", "over a" (WRONG), "a lazy", "lazy dog"
+                       → 5/8 = 63% match (missing "over the")
+  Trigrams (3-word):   "The quick brown", "quick brown fox", "brown fox jumps", ...
+                       → similar degradation
+  4-grams:             4-word phrases, even lower overlap
+
+BLEU-4 = BP × exp(0.25 × (log(0.89) + log(0.63) + ...) + ...)
+       ≈ 0.72 (out of 1.0)
+```
+
+**Pros:**
+- ✅ Fast (milliseconds per comparison)
+- ✅ Cost-free (no API calls)
+- ✅ Deterministic (same input → same score)
+- ✅ Works for machine translation, summarization, question answering
+- ✅ Correlates reasonably with human judgment on these tasks
+
+**Cons:**
+- ❌ Penalizes paraphrases: "fast canine" vs. "quick fox" = 0% match despite being synonymous
+- ❌ Doesn't capture semantic meaning
+- ❌ Requires reference text (doesn't work for open-ended generation)
+- ❌ Unreliable on short outputs (brevity penalty is harsh)
+- ❌ No credit for partial correctness
+
+**When to use BLEU:**
+- **Machine translation**: "Translate Spanish → English" (one correct translation structure)
+- **Summarization**: "Generate 3-sentence summary of article" (similar condensing patterns)
+- **Question answering**: "Answer: What is capital of France?" (expected answer: "Paris")
+- **Data-to-text**: "Generate sentence from table row" (structured inputs, templated outputs)
+
+**Code example:**
+```python
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+
+reference = "The quick brown fox jumps over the lazy dog".split()
+candidate = "The quick brown fox jumps over a lazy dog".split()
+
+# BLEU-4 (weights for 1, 2, 3, 4-grams)
+weights = (0.25, 0.25, 0.25, 0.25)
+smoothing = SmoothingFunction().method1
+
+score = sentence_bleu(
+    [reference],
+    candidate,
+    weights=weights,
+    smoothing_function=smoothing
+)
+print(f"BLEU-4: {score:.3f}")  # → 0.714
+```
+
+---
+
+## ROUGE Score (Recall-Oriented Understudy for Gisting Evaluation)
+
+**What it is:** Measures n-gram **recall** — what fraction of the reference's n-grams appear in the generated text. (BLEU uses precision; ROUGE uses recall.)
+
+**Three main variants:**
+
+### ROUGE-N: N-gram Overlap
+
+```
+ROUGE-N = (# of n-grams in reference that appear in generated) / (total n-grams in reference)
+```
+
+**Example:**
+
+```
+Reference:
+  "The quick brown fox jumps over the lazy dog"
+  Unigrams: {The, quick, brown, fox, jumps, over, the, lazy, dog}  [9 total]
+
+Generated:
+  "The quick brown fox jumps over a lazy dog"
+  Unigrams: {The, quick, brown, fox, jumps, over, a, lazy, dog}
+
+Matching unigrams: {The, quick, brown, fox, jumps, over, lazy, dog}  [8 match]
+
+ROUGE-1 = 8 / 9 = 0.889
+```
+
+### ROUGE-L: Longest Common Subsequence
+
+Measures longest substring that appears in both texts (allows gaps, doesn't require contiguity).
+
+```
+ROUGE-L = (longest common subsequence length) / (reference length)
+
+Example:
+Reference: "The quick brown fox"      [4 words]
+Generated: "The brown quick fox"      [4 words]
+
+Longest common subsequence: "The", "brown", "fox"  [3 words, different order]
+
+ROUGE-L = 3 / 4 = 0.75
+```
+
+This is better at capturing reorderings/paraphrases than ROUGE-N.
+
+### ROUGE-S: Skip-Bigram (Unigram Pairs)
+
+Bigrams where words don't have to be adjacent.
+
+```
+Reference:  "The quick brown fox"
+Bigrams: (The, quick), (The, brown), (The, fox), (quick, brown), (quick, fox), (brown, fox)
+
+Generated: "The brown quick fox"
+Bigrams: (The, brown), (The, quick), (The, fox), (brown, quick), (brown, fox), (quick, fox)
+
+ROUGE-S matches all 6 bigrams → perfect 1.0 score (even though word order differs)
+```
+
+**Pros:**
+- ✅ Fast (milliseconds)
+- ✅ Cost-free
+- ✅ ROUGE-L and ROUGE-S handle paraphrasing better than BLEU
+- ✅ Works for any task with reference text
+- ✅ Recall-based (penalizes missing content from reference, not hallucination)
+
+**Cons:**
+- ❌ Still penalizes legitimate paraphrases (e.g., "smart canine" vs. "intelligent dog")
+- ❌ Doesn't measure semantic correctness
+- ❌ Requires reference text
+- ❌ Can't detect factual errors (if generated text matches reference structure but has wrong facts)
+
+**When to use ROUGE:**
+- **Summarization**: (Reference summary exists; compare system output)
+- **Machine translation**: (Reference translation given)
+- **Paraphrase detection**: (Especially ROUGE-L and ROUGE-S)
+- **Document retrieval**: (ROUGE can match documents to queries)
+
+**Code example:**
+```python
+from rouge_score import rouge_scorer
+
+reference = "The quick brown fox jumps over the lazy dog"
+generated = "The quick brown fox jumps over a lazy dog"
+
+scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+scores = scorer.score(reference, generated)
+
+print(f"ROUGE-1 F1: {scores['rouge1'].fmeasure:.3f}")  # → 0.889
+print(f"ROUGE-L F1: {scores['rougeL'].fmeasure:.3f}")  # → 0.857
+```
+
+---
+
+## BLEU vs ROUGE vs LLM Judge
+
+| Metric | Speed | Cost | Semantic | Paraphrase | Open-Ended | Reference Required |
+|--------|-------|------|----------|-----------|------------|-------------------|
+| **BLEU** | 1ms | Free | ❌ No | ❌ Poor | ❌ No | ✅ Yes |
+| **ROUGE** | 1ms | Free | ❌ No | ⚠️ Medium | ❌ No | ✅ Yes |
+| **LLM Judge** | 200ms | $0.01 | ✅ Yes | ✅ Good | ✅ Yes | ❌ No |
+
+---
+
+## When To Use Each
+
+### Use BLEU/ROUGE:
+```
+Task: "Summarize this article in 3 sentences"
+Why: Reference summaries exist; paraphrasing OK; fast feedback needed
+
+Task: "Translate English → Spanish"
+Why: Structure-based task; reference translation available
+
+Task: "Extract named entities"
+Why: Exact matches expected; deterministic answers
+```
+
+### Use LLM Judge:
+```
+Task: "Grade essay quality (1-5)"
+Why: No reference answer; requires semantic understanding; requires nuance
+
+Task: "Does this explanation correctly answer the question?"
+Why: Requires reasoning; many valid phrasings; needs judgment
+
+Task: "Rate code quality (readability, efficiency, style)"
+Why: Multiple valid approaches; subjective rubric; needs understanding
+```
+
+---
+
+## In This LLM Judge Design
+
+BLEU/ROUGE are **not used** as the evaluation mechanism because:
+
+1. **Essays, code, explanations have no single "correct answer"** — you can't use BLEU (requires reference)
+2. **Human judgment is needed** — graders score based on quality rubric, not n-gram overlap
+3. **LLM judge replaces automatic metrics** — it reasons about the quality, not just string overlap
+
+However, BLEU/ROUGE could be **auxiliary metrics** in the confidence calibration loop:
+
+```python
+# In the LLM judge prompt:
+"Score this essay 1-5 based on the rubric.
+Also compute ROUGE-L vs. a reference answer (if available).
+Use both your semantic judgment + ROUGE as confidence signals."
+
+# Then calibrate LLM confidence against:
+#   1. Human ground truth (primary)
+#   2. ROUGE score (secondary signal for certain items)
+```
+
+This is rare in essay grading but common in summarization/QA evaluation systems.
+
+*Pointer:* [solution.md](solution.md), Section 2.2 "LLM Judge Prompt & Structured Output"
+
+---
 
 #### Q: Can you walk me through isotonic regression with a concrete example? `[ANSWERED]`
 
