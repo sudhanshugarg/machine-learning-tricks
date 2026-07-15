@@ -213,6 +213,132 @@ Sim runs themselves are the dominant cost; this pipeline is ~5–10% of total si
 
 ## Deep-Dives & Edge Cases
 
+### Q: Can you explain the sim-to-real gap metric with a concrete example? `[ANSWERED]`
+
+**A:** The sim-to-real gap measures how well your simulator matches the real world. Small gaps are good (simulator is well-calibrated); large gaps indicate distribution shift and require investigation.
+
+**Definition**:
+```
+gap[cluster] = |sim_metric[cluster] - real_metric[cluster]| / std(real_metric[cluster])
+```
+
+This is a **standardized gap** — you measure the difference in units of real-world standard deviation. Why? Because a 0.5% collision rate difference matters more on a rare scenario (high variance) than a common one (low variance).
+
+#### Example 1: Urban Intersection (Good Calibration)
+
+**Real-world data** (from 150 on-road runs in urban intersections):
+- Collision rate: 0.8%
+- Standard deviation: 0.2%
+- Latency (p99): 95 ms
+
+**Simulated data** (from 5,000 sim runs, same scenario cluster):
+- Collision rate: 0.85%
+- Standard deviation: 0.1%
+- Latency (p99): 93 ms
+
+**Calculate gap**:
+```
+gap[urban_intersection] = |0.85% - 0.8%| / 0.2% = 0.05% / 0.2% = 0.25σ
+```
+
+**Interpretation**: The simulator predicts 0.25 standard deviations higher collision rate than reality. This is **excellent agreement**. Why? Because:
+- The difference (0.05%) is tiny in absolute terms
+- It's only 1/4 of a standard deviation — well within natural noise
+- Model is safe to promote (simulator is slightly conservative, which is safer)
+
+**Decision**: ✅ **Pass the alignment check.** Simulator generalizes well to real-world urban intersections.
+
+---
+
+#### Example 2: Highway Merging (Distribution Mismatch)
+
+**Real-world data** (from 120 on-road runs, highway merging):
+- Collision rate: 0.6%
+- Standard deviation: 0.3%
+- Latency (p99): 110 ms
+
+**Simulated data** (from 8,000 sim runs, same scenario cluster):
+- Collision rate: 0.3%
+- Standard deviation: 0.1%
+- Latency (p99): 75 ms
+
+**Calculate gap**:
+```
+gap[highway_merging] = |0.3% - 0.6%| / 0.3% = 0.3% / 0.3% = 1.0σ
+```
+
+**Interpretation**: Simulator predicts **1 standard deviation lower** collision rate than reality. This is moderate concern:
+- Real world: 0.6% collisions
+- Sim world: 0.3% collisions
+- Gap is 100% of real variance — not negligible
+
+**Why does this happen?**
+- Highway merging has complex multi-agent behavior (vehicles cutting in, lane changes)
+- Simulator likely uses simplified traffic models (pre-canned trajectories, not reactive agents)
+- Possible: poor calibration of sensor noise (highway merging is more sensitive to perception latency)
+
+**Decision**: ⚠️ **Investigate, but not automatically blocked.** Promotion gate checks:
+- Does sim metric pass safety threshold? 0.3% < 0.5% → ✅ Yes
+- Does real metric pass safety threshold? 0.6% < 0.5% → ❌ No
+- Is gap < 1.5σ? 1.0σ < 1.5σ → ✅ Yes (just barely)
+
+**Mitigation**: Either (a) lower sim collision rate threshold for highway scenarios to account for the gap, or (b) investigate & recalibrate the simulator's highway merging model before promoting.
+
+---
+
+#### Example 3: Rain on Urban Street (Misaligned Distribution)
+
+**Real-world data** (from 45 on-road runs, heavy rain on urban streets):
+- Collision rate: 2.1%
+- Standard deviation: 0.5%
+- Latency (p99): 250 ms (perception is slower in rain)
+
+**Simulated data** (from 3,000 sim runs, heavy rain scenario):
+- Collision rate: 0.4%
+- Standard deviation: 0.15%
+- Latency (p99): 100 ms
+
+**Calculate gap**:
+```
+gap[rain_urban] = |0.4% - 2.1%| / 0.5% = 1.7% / 0.5% = 3.4σ
+```
+
+**Interpretation**: Simulator is **3.4 standard deviations too optimistic**. This is a **critical mismatch**:
+- Real world: 2.1% collision rate
+- Sim world: 0.4% collision rate
+- Difference: 1.7% — **more than 3σ away**
+
+**Why?**
+- Simulator's rain rendering doesn't degrade sensor realism enough
+- Real cameras have real rain drops on lens; sim sensors don't
+- Sim perception latency (100ms) is much lower than real (250ms)
+- Simulator hasn't been trained / validated on rainy conditions
+
+**Decision**: 🚨 **Block promotion, investigate simulator.**
+
+The gate fails the alignment check: gap > 1.5σ. Before deploying this model, you must:
+1. Improve rain simulation (add photorealistic rain drops, degrade sensor output)
+2. Increase simulated perception latency to match real systems
+3. Re-run evaluation; recompute gap
+4. Only promote after gap < 1.5σ
+
+---
+
+#### Summary: Gap Interpretation
+
+| Gap (σ) | Real-world Match | Action |
+|---------|------------------|--------|
+| < 0.5σ | Excellent calibration | ✅ Safe to promote |
+| 0.5–1.5σ | Good match, monitor | ✅ Promote with notes; monitor real metrics |
+| 1.5–2.5σ | Concerning drift | ⚠️ Investigate simulator; may block |
+| > 2.5σ | Severe mismatch | 🚨 Block promotion; recalibrate |
+
+**Key insight**: You're not asking "is the simulator perfect?" (it never is). You're asking "**is the simulator consistently wrong in a predictable way?**" If real and sim agree (gap is small), your models will generalize. If they diverge (gap is large), your simulator is useless as a safety signal.
+
+*Pointer:* [solution.md § 5. Sim-vs-Real Reconciliation](solution.md); [§ 9. Failure Modes — sim-to-real gap alarm](solution.md).
+
+---
+
 ### Q: What if the scenario library gets updated? Do old sim runs become invalid?
 **A:** Not automatically. A scenario library update (e.g., new intersection definition) only invalidates runs that used the old definition **if the change is breaking** (e.g., intersection geometry changed fundamentally).
 
