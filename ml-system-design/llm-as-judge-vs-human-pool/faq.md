@@ -7,6 +7,7 @@
 | 2026-07-14 | LLM Calibration | Why calibrate confidence (not score)? How do you group calibration data? | [ANSWERED] |
 | 2026-07-14 | Evaluation & Metrics | How do you compute Spearman's correlation coefficient? | [ANSWERED] |
 | 2026-07-14 | Evaluation & Metrics | Why is there a 6 in the Spearman formula? | [ANSWERED] |
+| 2026-07-14 | Routing Strategy | How does the initial confidence get computed? When does LLM run? | [ANSWERED] |
 
 ---
 
@@ -80,6 +81,111 @@
 ---
 
 ### Routing Strategy
+
+#### Q: How does the initial confidence get computed? When does the LLM judge run? `[ANSWERED]`
+
+**A:**
+
+**Items arrive with NO confidence.** The LLM judge runs immediately on every item, and its output confidence is what drives the routing decision.
+
+**The actual flow:**
+
+```
+Item intake (essay, code, etc.)
+    ↓
+LLM Judge runs immediately [ALWAYS]
+  Input: submission + rubric
+  Output:
+    {
+      "score": 4,
+      "confidence": 0.95,
+      "reasoning": "..."
+    }
+    ↓
+Router uses LLM confidence to decide
+  ├─ conf ≥ 0.90 → LLM-only (return score immediately)
+  ├─ conf 0.70-0.90 → Send to human pool (high-value uncertain cases)
+  └─ conf < 0.70 → Send to human + run ensemble (risky cases)
+    ↓
+[If human also evaluates]
+    Aggregate LLM + human scores
+    ↓
+Final score + audit trail
+```
+
+**Example timeline:**
+
+```
+T=0ms:    Item 1 arrives
+T=0-200ms: LLM judge evaluates (3 models in parallel)
+T=200ms:   LLM outputs: score=4, confidence=0.95
+T=201ms:   Router decision: confidence 0.95 > 0.90 → LLM-only
+T=202ms:   Return final score to client (latency: 202ms)
+
+Cost: $0.005
+Humans: not involved
+```
+
+vs.
+
+```
+T=0ms:    Item 2 arrives
+T=0-200ms: LLM judge evaluates
+T=200ms:   LLM outputs: score=3, confidence=0.68
+T=201ms:   Router decision: confidence 0.68 in [0.70, 0.90) → send to human
+T=202ms:   Queue to human pool (FIFO by tier)
+T=5-30min: Human evaluates; outputs: score=3
+T=5-30min: Aggregate: LLM (3, conf 0.68) + Human (3, conf 0.95) → Final: 3
+T=5-30min: Return final score to client (latency: 5-30 min)
+
+Cost: $0.005 (LLM) + $1.00 (human) = $1.005
+Humans: involved
+```
+
+**Where does the LLM's confidence number come from?**
+
+The LLM outputs it directly via **structured decoding**:
+
+```python
+system_prompt = """
+You are an expert evaluator. Grade submissions on a 1-5 scale.
+Output JSON with score, confidence (0.0-1.0), and reasoning.
+Confidence: how sure are you about this score?
+"""
+
+user_prompt = """
+Submission: [essay text]
+Rubric: [detailed rubric]
+
+Output JSON:
+{
+  "score": <int 1-5>,
+  "confidence": <float 0.0-1.0>,
+  "reasoning": <string>
+}
+"""
+
+# LLM response
+{
+  "score": 4,
+  "confidence": 0.95,
+  "reasoning": "Clear thesis with strong evidence..."
+}
+```
+
+The LLM generates a confidence value (0.0-1.0) as part of its output. This is the model's own estimate of certainty based on its training.
+
+**But is this confidence accurate?**
+
+**No.** That's the whole point of Platt scaling (from the earlier FAQ Q&A):
+
+1. Raw LLM confidence (0.95) is often miscalibrated
+2. Platt scaling maps it to true accuracy (e.g., 0.95 → 0.92)
+3. Routing uses the calibrated confidence, not the raw confidence
+
+**Key insight:** The LLM runs on ALL items. Its 200ms latency is unavoidable. But this fast 200ms evaluation lets us route intelligently: 95% of easy items go LLM-only (instant), 5% of hard items go to humans (for quality).
+
+*Pointer:* [solution.md](solution.md), Section 1 "Router & Triage" and Section 2.2 "Structured Output"
 
 *(Answers go here)*
 
