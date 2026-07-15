@@ -8,6 +8,7 @@
 | 2026-07-14 | Evaluation & Metrics | How do you compute Spearman's correlation coefficient? | [ANSWERED] |
 | 2026-07-14 | Evaluation & Metrics | Why is there a 6 in the Spearman formula? | [ANSWERED] |
 | 2026-07-14 | Routing Strategy | How does the initial confidence get computed? When does LLM run? | [ANSWERED] |
+| 2026-07-14 | Score Aggregation | If LLM gave 0.5 confidence and human gave 0.9, what's the final confidence? | [ANSWERED] |
 
 ---
 
@@ -187,15 +188,168 @@ The LLM generates a confidence value (0.0-1.0) as part of its output. This is th
 
 *Pointer:* [solution.md](solution.md), Section 1 "Router & Triage" and Section 2.2 "Structured Output"
 
-*(Answers go here)*
-
 ### Human Pool Management
 
 *(Answers go here)*
 
 ### Score Aggregation & Consensus
 
-*(Answers go here)*
+#### Q: If LLM gave 0.5 confidence and human gave 0.9, what's the final confidence sent to the user? `[ANSWERED]`
+
+**A:**
+
+**Short answer:** With the current solution, it would be **min(0.5, 0.9) = 0.5** (conservative approach).
+
+But first, clarify: **what does "human confidence" mean?** There are a few options:
+
+---
+
+## Option 1: Human Confidence from Rater Accuracy (Current Solution)
+
+Each human rater has a historical accuracy profile:
+
+```python
+class RaterProfile:
+    rater_id: str
+    tier: str
+    accuracy: float  # P(rater's score == gold standard)
+    # e.g., tier-1 expert = 0.95 accuracy
+```
+
+So "human confidence" = the rater's historical accuracy, not something they output per item.
+
+**Example:**
+```
+Item scored by tier-1 expert (accuracy = 0.95)
+LLM gave score=3, confidence=0.5
+Human gave score=3, confidence=0.95 (their tier accuracy)
+
+Aggregation:
+  llm_weight = 0.5
+  human_weight = 0.95
+  
+  # Scores agree (both 3)
+  final_score = weighted_avg(3, 3) = 3
+  final_confidence = min(0.5, 0.95) = 0.5
+```
+
+**Why use min()?** The idea is: "our final answer is only as confident as our least confident signal." If the LLM is uncertain (0.5), we can't be more confident than that, even if the human agrees.
+
+---
+
+## Option 2: Human Outputs Confidence (Better)
+
+You could ask humans to output confidence like LLM does:
+
+```python
+human_output = {
+    "score": 3,
+    "confidence": 0.9,  # human's own uncertainty estimate
+    "reasoning": "..."
+}
+```
+
+Then aggregate the same way:
+```
+final_confidence = min(llm_confidence, human_confidence)
+                 = min(0.5, 0.9) = 0.5
+```
+
+**Pros:** More granular (humans rate their own certainty per item)
+**Cons:** Humans often output overconfident or underconfident numbers (just like LLMs!)
+
+---
+
+## Option 3: Inter-Rater Agreement (Better for Consensus)
+
+If you send the item to **multiple humans** (e.g., 2-3 raters):
+
+```python
+def consensus_score(rater_scores: List[int]) -> Tuple[int, float]:
+    """Majority vote with confidence based on agreement."""
+    mode = statistics.mode(rater_scores)
+    agreement_ratio = rater_scores.count(mode) / len(rater_scores)
+    confidence = agreement_ratio  # high agreement → high confidence
+    return mode, confidence
+
+# Example:
+rater_scores = [3, 3, 2]  # 2 raters agree on 3, 1 disagrees
+final_score = 3
+human_confidence = 2/3 ≈ 0.67  # agreement ratio
+```
+
+Then aggregate with LLM:
+```
+final_confidence = min(0.5, 0.67) = 0.5
+```
+
+---
+
+## The Problem with min()
+
+Using `min()` is conservative but feels wrong in some cases:
+
+```
+Case 1: LLM and human agree
+  LLM: score=3, confidence=0.5
+  Human: score=3, confidence=0.95
+  Final: score=3, confidence=0.5 ← feels wrong! They agree, so we should be confident
+
+Case 2: LLM and human disagree
+  LLM: score=3, confidence=0.95
+  Human: score=2, confidence=0.90
+  Final: score=2.5 (weighted avg), confidence=0.90 ← should be lower due to disagreement
+```
+
+---
+
+## Better Aggregation Strategy
+
+**The solution code actually has this logic:**
+
+```python
+# If they strongly disagree, flag and lower confidence
+if abs(llm_score - human_avg) > 1.5:
+    return int(human_avg), 0.6, "disagreement_flagged"
+
+# If they agree, use weighted average
+final = (llm_score * llm_weight + human_avg * human_weight) / total_weight
+confidence = min(llm_weight, human_weight)
+```
+
+**Better approach:** Consider agreement as a signal:
+
+```python
+# If they agree → boost confidence
+# If they disagree → reduce confidence
+agreement_bonus = 0.0 if abs(llm_score - human_avg) > 0.5 else 0.1
+
+final_confidence = min(llm_weight, human_weight) + agreement_bonus
+final_confidence = min(final_confidence, 0.99)  # cap at 0.99
+```
+
+**Example with better logic:**
+```
+LLM: score=3, confidence=0.5
+Human: score=3, confidence=0.95
+
+They agree (diff = 0)
+final_score = 3
+final_confidence = min(0.5, 0.95) + 0.1 = 0.6 ← boosted!
+```
+
+---
+
+## Summary
+
+| Approach | Final Confidence | Pro | Con |
+|----------|------------------|-----|-----|
+| min(LLM, human) | 0.5 | Conservative | Doesn't reward agreement |
+| max(LLM, human) | 0.9 | Optimistic | Too trusting of either signal |
+| weighted_avg(LLM, human) | 0.72 | Balanced | Ignores disagreement |
+| min() + agreement_bonus | 0.6 | Smart | Complex logic |
+
+*Pointer:* [solution.md](solution.md), Section 4.1 "Aggregation Rules" — shows the actual code used
 
 ### Cost Optimization
 
