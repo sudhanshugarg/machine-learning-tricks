@@ -1,0 +1,5 @@
+ - Requirements
+ - Functional (Business / product)
+   - identify error
+ - Non Functional (Engineering)
+   - latency, throughput (qps), error rate, precision/recall
