@@ -9,6 +9,7 @@
 | 2026-07-14 | Evaluation & Metrics | Why is there a 6 in the Spearman formula? | [ANSWERED] |
 | 2026-07-14 | Routing Strategy | How does the initial confidence get computed? When does LLM run? | [ANSWERED] |
 | 2026-07-14 | Score Aggregation | If LLM gave 0.5 confidence and human gave 0.9, what's the final confidence? | [ANSWERED] |
+| 2026-07-14 | LLM Calibration | When would I use Platt scaling vs isotonic regression? | [ANSWERED] |
 
 ---
 
@@ -515,3 +516,203 @@ human_scores = [5, 3, 4, 2, 1]
 rho, p_value = spearmanr(llm_scores, human_scores)
 # scipy handles the tie automatically
 ```
+
+#### Q: When would I use Platt scaling vs isotonic regression for calibration? `[ANSWERED]`
+
+**A:**
+
+Both are used to calibrate confidence → accuracy mapping, but they make different trade-offs. Here's the comparison:
+
+---
+
+## Platt Scaling
+
+**What it is:** Fit a logistic function to the data.
+
+```python
+# Fit
+from sklearn.linear_model import LogisticRegression
+
+platt = LogisticRegression()
+platt.fit(X=raw_confidences.reshape(-1, 1), y=is_correct)
+
+# Predict
+calibrated_accuracy = platt.predict_proba([[0.95]])[0][1]
+```
+
+**Formula:**
+```
+P(correct) = sigmoid(a * confidence + b)
+           = 1 / (1 + exp(-(a*confidence + b)))
+```
+
+**Pros:**
+- **Parametric:** Only 2 parameters (a, b) → low overfitting risk
+- **Fast:** Simple matrix operations
+- **Interpretable:** Clear sigmoid shape
+- **Small data OK:** Works well with ~1000 calibration samples
+- **Well-behaved:** Assumes smooth, monotonic relationship (usually true for confidence)
+
+**Cons:**
+- **Rigid shape:** Assumes sigmoid. If true curve is different (e.g., S-curve flipped), it won't fit well
+- **Worse fit:** May underfit if true relationship is complex
+- **Less flexible:** Can't learn bumpy/non-standard curves
+
+**Good for:**
+- Small to medium calibration sets (< 10K samples)
+- Well-behaved confidence (monotonic, no weird jumps)
+- Production systems where interpretability matters
+- Fast iteration and low compute
+
+---
+
+## Isotonic Regression
+
+**What it is:** Fit a non-parametric monotonic curve to the data.
+
+```python
+from sklearn.isotonic import IsotonicRegression
+
+iso = IsotonicRegression(out_of_bounds='clip')
+iso.fit(X=raw_confidences, y=is_correct)
+
+calibrated_accuracy = iso.predict([0.95])
+```
+
+**How it works:**
+- Finds a monotonically increasing function that best fits the data
+- No shape assumption (not sigmoid, not linear—whatever the data shows)
+- Piecewise-linear (connects calibration points with straight lines)
+
+**Pros:**
+- **Non-parametric:** Fits any monotonic curve (no shape assumption)
+- **Flexible:** Can learn complex relationships (S-curves, flat regions, steep jumps)
+- **Better fit:** Lower calibration error when relationship is non-sigmoid
+- **Large data OK:** Works well with 10K+ calibration samples
+
+**Cons:**
+- **More parameters:** Requires more calibration data to avoid overfitting
+- **Slower:** More complex computation
+- **Less interpretable:** Can produce odd-looking curves
+- **Overfitting risk:** With small data, can fit noise instead of signal
+- **Edge case handling:** Needs care for out-of-range predictions
+
+**Good for:**
+- Large calibration sets (10K+ samples)
+- Unknown/complex relationship between confidence and accuracy
+- When you have time to experiment with hyperparameters
+- Research/offline settings where compute isn't constrained
+
+---
+
+## Visual Comparison
+
+```
+Calibration data: (confidence, accuracy) pairs
+
+Data points:
+0.95 → 0.92
+0.85 → 0.80
+0.75 → 0.75
+0.60 → 0.60
+0.50 → 0.55
+
+
+Platt Scaling:          Isotonic Regression:
+(smooth sigmoid curve)  (piecewise linear curve)
+
+  1.0 ┌─────────         1.0 ┌─────────
+      │    ╱╱╱              │╱╱
+  0.9 │   ╱                │╱
+      │  ╱                │
+  0.8 │ ╱                 │•──
+      │╱                  │   •──
+  0.7 ├────────           │       •──
+      │•                  │           •─
+  0.6 │ •                 │             •
+      │  •                │
+  0.5 │   •               │
+      │    •              │
+  0.4 └────────           └─────────
+      0.5  0.75  1.0     0.5  0.75  1.0
+```
+
+Platt is smooth; isotonic follows data more closely.
+
+---
+
+## Decision Matrix
+
+| Factor | Platt | Isotonic |
+|--------|-------|----------|
+| **Calibration data size** | < 10K ✓ | > 10K ✓ |
+| **Compute cost** | Fast ✓ | Slower |
+| **Interpretability** | Clear ✓ | Opaque |
+| **Overfitting risk** | Low ✓ | High (needs tuning) |
+| **Fit quality** | Good | Excellent ✓ |
+| **Well-behaved confidence** | ✓✓ | ✓ |
+| **Unknown/complex relationship** | ✓ | ✓✓ |
+| **Production ready** | ✓✓ | ✓ |
+
+---
+
+## Practical Recommendation for This Design
+
+**Start with Platt scaling:**
+- 10K-item calibration set is small-to-medium
+- LLM confidence is usually well-behaved (monotonic)
+- Production system needs speed and interpretability
+- 2-parameter model = easy to monitor, retrain monthly
+
+**Switch to isotonic if:**
+- You notice Platt's calibration error is > 10%
+- Your data analysis reveals non-sigmoid relationship (e.g., bimodal)
+- You have 50K+ calibration items and want lower error
+- You can afford compute + complexity overhead
+
+---
+
+## Code Example: Comparing Both
+
+```python
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import brier_score_loss
+
+# Calibration set: (confidence, is_correct) pairs
+X_cal = np.array([0.95, 0.85, 0.75, 0.60, 0.50, ...])  # 10K items
+y_cal = np.array([0.92, 0.80, 0.75, 0.60, 0.55, ...])  # actual accuracy
+
+# Platt Scaling
+platt = LogisticRegression()
+platt.fit(X_cal.reshape(-1, 1), y_cal)
+platt_pred = platt.predict_proba(X_cal.reshape(-1, 1))[:, 1]
+platt_error = brier_score_loss(y_cal, platt_pred)
+
+# Isotonic Regression
+iso = IsotonicRegression(out_of_bounds='clip')
+iso.fit(X_cal, y_cal)
+iso_pred = iso.predict(X_cal)
+iso_error = brier_score_loss(y_cal, iso_pred)
+
+print(f"Platt error: {platt_error:.4f}")
+print(f"Isotonic error: {iso_error:.4f}")
+
+# Choose the better one for production
+if iso_error < platt_error - 0.01:  # isotonic better by >1%
+    calibrator = iso
+else:
+    calibrator = platt  # stick with Platt (simpler)
+```
+
+---
+
+## Summary
+
+- **Platt**: Simple, fast, robust for small data, assumes sigmoid shape
+- **Isotonic**: Flexible, better fit for large data, no shape assumption, more complex
+
+For this evaluation system: **Start with Platt, monitor quarterly, switch to isotonic if calibration error degrades.**
+
+*Pointer:* [solution.md](solution.md), Section 2.3 "Confidence Calibration via Platt Scaling"
