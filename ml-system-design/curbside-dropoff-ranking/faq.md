@@ -12,6 +12,7 @@
 | 6 | - | Terminology | What does "calibration" mean in the context of LambdaMART scores? | [ANSWERED](#q6-what-does-calibration-mean-in-the-context-of-lambdamart-scores-answered) |
 | 7 | - | Math | Walk through an isotonic regression example step-by-step. | [ANSWERED](#q7-walk-through-an-isotonic-regression-example-step-by-step-answered) |
 | 8 | - | Architecture | How do you avoid the ranker overriding safety rules? | [ANSWERED](#q8-how-do-you-avoid-the-ranker-overriding-safety-rules-answered) |
+| 9 | - | Metrics | What is NDCG@5 and how do you calculate it? | [ANSWERED](#q9-what-is-ndcg5-and-how-do-you-calculate-it-answered) |
 
 ---
 
@@ -470,6 +471,211 @@ If either threshold breached → investigate hard filter logic
 ```
 
 *Pointer:* [solution.md](solution.md), Section 2 — Hard Constraint Filter
+
+---
+
+### Q9: What is NDCG@5 and how do you calculate it? `[ANSWERED]`
+
+**A:**
+
+**NDCG** stands for **Normalized Discounted Cumulative Gain**. It measures how well a ranking system orders candidates, with emphasis on getting the best items at the top.
+
+**@5** means we only look at the top 5 ranked items (hence "NDCG@5").
+
+**Why NDCG matters:**
+- It captures the ranking quality holistically: you want the best candidates ranked first, second-best second, etc.
+- **Unlike accuracy**, which only cares if the top choice is correct, NDCG rewards having good candidates throughout the top-5
+- **In our problem**: If the top candidate has a 12 m walk and rank 2 has 15 m walk, NDCG@5 penalizes us less than if rank 1 were 45 m and rank 2 were 12 m
+
+---
+
+## Step-by-Step Example
+
+### Setup: A single drop-off scenario
+
+**Ground truth relevance** (what passengers actually prefer, measured by satisfaction):
+```
+Spot A: 5-star rating (perfect)
+Spot B: 4-star rating (good)
+Spot C: 2-star rating (bad)
+Spot D: 3-star rating (okay)
+Spot E: 1-star rating (terrible)
+...
+(100 other spots with ratings 0-5)
+```
+
+**Ideal ranking** (if we could rank by relevance):
+```
+Rank 1: Spot A (5 stars)
+Rank 2: Spot B (4 stars)
+Rank 3: Spot D (3 stars)
+Rank 4: Spot C (2 stars)
+Rank 5: Any other spot (1-0 stars)
+```
+
+**Model's predicted ranking** (what our LambdaMART ranker outputs):
+```
+Rank 1: Spot C (model thinks it's best, but it's actually 2-star)
+Rank 2: Spot A (model thinks it's second, but it's actually best)
+Rank 3: Spot B (model thinks it's third, but it's actually second)
+Rank 4: Spot D (model thinks it's fourth, and it actually is)
+Rank 5: Spot E (model thinks it's fifth, and it actually is)
+```
+
+---
+
+### Calculation Step-by-Step
+
+#### Step 1: Compute DCG (Discounted Cumulative Gain)
+
+For the **model's ranking**, we compute how much "gain" we get at each position, discounted by how deep it is:
+
+```
+DCG = rel_1 / log₂(1+1) + rel_2 / log₂(2+1) + rel_3 / log₂(3+1) + rel_4 / log₂(4+1) + rel_5 / log₂(5+1)
+
+Where:
+  rel_i = relevance (star rating) of the spot at rank i
+  log₂(i+1) = discount factor (deeper ranks are discounted more)
+```
+
+**For the model's ranking:**
+```
+Rank 1: Spot C, relevance = 2 stars
+  Gain₁ = 2 / log₂(2) = 2 / 1.0 = 2.0
+
+Rank 2: Spot A, relevance = 5 stars
+  Gain₂ = 5 / log₂(3) = 5 / 1.585 = 3.15
+
+Rank 3: Spot B, relevance = 4 stars
+  Gain₃ = 4 / log₂(4) = 4 / 2.0 = 2.0
+
+Rank 4: Spot D, relevance = 3 stars
+  Gain₄ = 3 / log₂(5) = 3 / 2.322 = 1.29
+
+Rank 5: Spot E, relevance = 1 star
+  Gain₅ = 1 / log₂(6) = 1 / 2.585 = 0.39
+
+DCG = 2.0 + 3.15 + 2.0 + 1.29 + 0.39 = 8.83
+```
+
+#### Step 2: Compute IDCG (Ideal DCG)
+
+Now compute the DCG for the **ideal ranking** (sorted by true relevance):
+
+```
+Rank 1: Spot A, relevance = 5 stars
+  Gain₁ = 5 / log₂(2) = 5 / 1.0 = 5.0
+
+Rank 2: Spot B, relevance = 4 stars
+  Gain₂ = 4 / log₂(3) = 4 / 1.585 = 2.52
+
+Rank 3: Spot D, relevance = 3 stars
+  Gain₃ = 3 / log₂(4) = 3 / 2.0 = 1.5
+
+Rank 4: Spot C, relevance = 2 stars
+  Gain₄ = 2 / log₂(5) = 2 / 2.322 = 0.86
+
+Rank 5: Spot E, relevance = 1 star
+  Gain₅ = 1 / log₂(6) = 1 / 2.585 = 0.39
+
+IDCG = 5.0 + 2.52 + 1.5 + 0.86 + 0.39 = 10.27
+```
+
+#### Step 3: Compute NDCG@5
+
+Normalize DCG by IDCG:
+
+```
+NDCG@5 = DCG / IDCG = 8.83 / 10.27 = 0.860
+```
+
+---
+
+### Interpretation
+
+**NDCG@5 = 0.860** means the model achieved 86% of the ideal ranking quality.
+
+**What went wrong?**
+- Model ranked Spot C (2-star) at position 1, but Spot A (5-star) belongs there
+- Model ranked Spot A (5-star) at position 2, wasting the high-value position
+- Model got positions 4-5 correct (Spot D, Spot E)
+
+**Better example: NDCG@5 = 1.0 (perfect)**
+
+If the model's ranking matched the ideal ranking exactly:
+```
+DCG = 5.0 + 2.52 + 1.5 + 0.86 + 0.39 = 10.27
+NDCG@5 = 10.27 / 10.27 = 1.0
+```
+
+**Worse example: NDCG@5 = 0.5 (poor)**
+
+If the model completely reversed the order:
+```
+Rank 1: Spot E (relevance 1)  → 1 / log₂(2) = 1.0
+Rank 2: Spot C (relevance 2)  → 2 / log₂(3) = 1.26
+Rank 3: Spot D (relevance 3)  → 3 / log₂(4) = 1.5
+Rank 4: Spot B (relevance 4)  → 4 / log₂(5) = 1.72
+Rank 5: Spot A (relevance 5)  → 5 / log₂(6) = 1.93
+
+DCG ≈ 7.41
+NDCG@5 = 7.41 / 10.27 = 0.72 (still decent because some gain trickles through)
+```
+
+---
+
+### Why the Discount Factor?
+
+The discount factor `log₂(i+1)` ensures that **putting good items high is heavily rewarded**:
+
+```
+Position 1: discount = log₂(2) = 1.0     (no discount, full gain)
+Position 2: discount = log₂(3) ≈ 1.585   (15.8% discount)
+Position 3: discount = log₂(4) = 2.0     (50% discount)
+Position 4: discount = log₂(5) ≈ 2.322   (77% discount)
+Position 5: discount = log₂(6) ≈ 2.585   (87% discount)
+```
+
+**Intuition**: If a passenger is willing to check the top-3 candidates, it's much more important to rank the best spot in position 1 than to get position 5 right.
+
+In our curbside problem:
+- Position 1 (top candidate): Passenger will definitely try it
+- Position 2-3: Passenger will try if position 1 fails (replan scenario)
+- Position 4-5: Rarely used; mostly for fallback
+
+So NDCG@5 focuses on getting positions 1-2 right, which matches real-world behavior.
+
+---
+
+### NDCG@5 in Our Problem
+
+**Offline evaluation before deployment:**
+```
+Target: NDCG@5 > 0.85 (vs. rule-based baseline ≈ 0.75)
+Meaning: Our LambdaMART ranker achieves 85%+ of ideal ranking quality
+
+If NDCG@5 = 0.87:
+  → Significantly better than rule-based
+  → Safe to deploy
+
+If NDCG@5 = 0.78:
+  → Only slightly better than baseline
+  → Investigate model; retrain or tune
+```
+
+**Spearman correlation (complementary metric):**
+```
+NDCG measures ranking quality (are good items ranked high?).
+Spearman correlation measures ranking consistency (do the model and ground truth agree on ordering?).
+
+Together: NDCG@5 + Spearman ρ give a complete picture of ranker quality.
+
+Example:
+  NDCG@5 = 0.85, Spearman ρ = 0.7
+  → Model is ordering candidates well, and agrees with ground truth ~70% of the time
+```
+
+*Pointer:* [solution.md](solution.md), Section 6 — Evaluation (Offline Metrics)
 
 ---
 
