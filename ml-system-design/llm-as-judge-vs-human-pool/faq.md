@@ -15,6 +15,7 @@
 4. [How do you compute Spearman's correlation coefficient?](#q-how-do-you-compute-spearmans-correlation-coefficient-answered)
 5. [Why is there a 6 in the Spearman formula?](#q-why-is-there-a-6-in-the-spearman-formula-answered)
 6. [When would I use Platt scaling vs isotonic regression?](#q-when-would-i-use-platt-scaling-vs-isotonic-regression-for-calibration-answered)
+7. [Can you walk me through isotonic regression with a concrete example?](#q-can-you-walk-me-through-isotonic-regression-with-a-concrete-example-answered)
 
 ---
 
@@ -28,6 +29,7 @@
 | 2026-07-14 | Routing Strategy | How does the initial confidence get computed? When does LLM run? | [ANSWERED] |
 | 2026-07-14 | Score Aggregation | If LLM gave 0.5 confidence and human gave 0.9, what's the final confidence? | [ANSWERED] |
 | 2026-07-14 | LLM Calibration | When would I use Platt scaling vs isotonic regression? | [ANSWERED] |
+| 2026-07-14 | LLM Calibration | Can you walk me through isotonic regression with a concrete example? | [ANSWERED] |
 
 ---
 
@@ -732,5 +734,234 @@ else:
 - **Isotonic**: Flexible, better fit for large data, no shape assumption, more complex
 
 For this evaluation system: **Start with Platt, monitor quarterly, switch to isotonic if calibration error degrades.**
+
+*Pointer:* [solution.md](solution.md), Section 2.3 "Confidence Calibration via Platt Scaling"
+
+#### Q: Can you walk me through isotonic regression with a concrete example? `[ANSWERED]`
+
+**A:**
+
+Let me show you step-by-step how isotonic regression learns to map LLM confidence → actual accuracy using 10,000 evaluation items.
+
+---
+
+## The Data Setup
+
+You have:
+- 10,000 items evaluated by both LLM and human
+- LLM output: score (1-5) + confidence (0.0-1.0)
+- Human output: score (1-5) [ground truth]
+
+```
+Item  | LLM Score | LLM Conf | Human Score | Correct?
+------|-----------|----------|-------------|----------
+  1   |     4     |   0.95   |      4      |   YES (1)
+  2   |     3     |   0.95   |      2      |   NO  (0)
+  3   |     5     |   0.87   |      5      |   YES (1)
+  4   |     2     |   0.68   |      2      |   YES (1)
+  5   |     3     |   0.68   |      3      |   YES (1)
+  ... | ...       | ...      | ...         | ...
+10000 |     4     |   0.52   |      3      |   NO  (0)
+```
+
+## Step 1: Prepare Data for Calibration
+
+Convert to (confidence, is_correct) pairs:
+
+```python
+import numpy as np
+
+# Load 10,000 items
+llm_confidences = np.array([0.95, 0.95, 0.87, 0.68, 0.68, ..., 0.52])  # shape: (10000,)
+llm_scores = np.array([4, 3, 5, 2, 3, ..., 4])
+human_scores = np.array([4, 2, 5, 2, 3, ..., 3])
+
+# Create is_correct: did LLM match human?
+is_correct = (llm_scores == human_scores).astype(int)  # shape: (10000,)
+# [1, 0, 1, 1, 1, ..., 0]
+
+print(f"LLM accuracy overall: {is_correct.mean():.2%}")  # e.g., 78%
+```
+
+## Step 2: Fit Isotonic Regression
+
+```python
+from sklearn.isotonic import IsotonicRegression
+
+# Create and fit the calibrator
+iso = IsotonicRegression(out_of_bounds='clip')
+iso.fit(X=llm_confidences, y=is_correct)
+
+# What happened:
+# - iso learned a monotonic function: confidence → true_accuracy
+# - It found the best-fit curve through all 10,000 points
+```
+
+**What isotonic does internally:**
+
+1. Sorts the data by confidence (X)
+2. Computes the mean accuracy (y) for each confidence bin
+3. Applies PAV (Pool Adjacent Violators) algorithm to smooth into monotonic curve
+4. Creates piecewise-linear function connecting the bins
+
+```
+Raw means by confidence bin:
+Confidence [0.90-1.00]: 920/1000 correct → 92% accuracy
+Confidence [0.80-0.90): 760/1000 correct → 76% accuracy  ← violates monotonicity!
+Confidence [0.70-0.80): 750/1000 correct → 75% accuracy
+Confidence [0.60-0.70): 580/1000 correct → 58% accuracy
+
+After PAV smoothing (force monotonic):
+Confidence [0.90-1.00]: 92% accuracy
+Confidence [0.80-0.90): 76% accuracy  → becomes 80% (averaged with neighbor)
+Confidence [0.70-0.80): 75% accuracy  → becomes 77% (adjusted up)
+Confidence [0.60-0.70): 58% accuracy
+
+Result: monotonic increasing curve
+```
+
+## Step 3: Use the Fitted Calibrator
+
+For a new item with LLM confidence 0.87:
+
+```python
+# Get calibrated accuracy
+new_confidence = 0.87
+calibrated_accuracy = iso.predict([0.87])  # → e.g., 0.79
+
+# This means: "when LLM claims 0.87 confidence, it's actually correct ~79% of the time"
+```
+
+## Step 4: Visualize What It Learned
+
+```python
+import matplotlib.pyplot as plt
+
+# Generate curve
+x_range = np.linspace(0, 1, 100)
+y_calibrated = iso.predict(x_range)
+
+plt.figure(figsize=(10, 6))
+plt.scatter(llm_confidences, is_correct, alpha=0.1, label='Individual items')
+plt.plot(x_range, y_calibrated, 'r-', linewidth=2, label='Isotonic fit')
+plt.plot([0, 1], [0, 1], 'k--', alpha=0.3, label='Perfect calibration')
+plt.xlabel('LLM Confidence')
+plt.ylabel('True Accuracy')
+plt.legend()
+plt.grid()
+plt.title('Isotonic Regression: LLM Confidence → True Accuracy')
+plt.show()
+```
+
+**Output might look like:**
+
+```
+True Accuracy
+    1.0 ├──────────
+        │        ╱╱
+    0.9 │      ╱╱
+        │    ╱╱
+    0.8 │  ╱╱•──────  ← here: conf=0.87 → acc=0.79
+        │╱╱  •
+    0.7 ├────•─
+        │      •
+    0.6 │       •
+        │        •
+    0.5 │         •
+        │          •
+    0.4 └─────────────
+        0.5    0.75   1.0
+        LLM Confidence
+```
+
+## Full Example with Routing Decision
+
+```python
+from sklearn.isotonic import IsotonicRegression
+
+# Step 1: Fit on 10K calibration items
+iso = IsotonicRegression(out_of_bounds='clip')
+iso.fit(llm_confidences, is_correct)
+
+# Step 2: New item arrives with LLM confidence 0.68
+new_llm_confidence = 0.68
+calibrated_accuracy = iso.predict([0.68])[0]  # → 0.62
+
+# Step 3: Make routing decision
+if calibrated_accuracy >= 0.90:
+    decision = "LLM-only"
+    cost = 0.005
+elif calibrated_accuracy >= 0.75:
+    decision = "Send to human"
+    cost = 1.00
+else:
+    decision = "Human + secondary LLM"
+    cost = 1.50
+
+print(f"Raw LLM confidence: {new_llm_confidence}")
+print(f"Calibrated accuracy: {calibrated_accuracy:.2%}")
+print(f"Decision: {decision}")
+print(f"Est. cost: ${cost}")
+
+# Output:
+# Raw LLM confidence: 0.68
+# Calibrated accuracy: 62%
+# Decision: Send to human
+# Est. cost: $1.00
+```
+
+## Why Isotonic Learned This Mapping
+
+Isotonic doesn't assume any particular shape. It just looks at the data:
+
+```
+"When LLM said 0.95:  920/1000 times correct (92%)"
+"When LLM said 0.85:  760/1000 times correct (76%)"
+"When LLM said 0.75:  750/1000 times correct (75%)"
+"When LLM said 0.65:  580/1000 times correct (58%)"
+"When LLM said 0.55:  420/1000 times correct (42%)"
+
+→ Learns: "higher confidence → higher accuracy" (monotonic)
+→ Creates piecewise-linear curve through these points
+```
+
+## Isotonic vs Platt on This Data
+
+```python
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss
+
+# Fit both
+iso = IsotonicRegression()
+iso.fit(llm_confidences, is_correct)
+
+platt = LogisticRegression()
+platt.fit(llm_confidences.reshape(-1, 1), is_correct)
+
+# Evaluate on same data
+iso_pred = iso.predict(llm_confidences)
+platt_pred = platt.predict_proba(llm_confidences.reshape(-1, 1))[:, 1]
+
+iso_error = brier_score_loss(is_correct, iso_pred)
+platt_error = brier_score_loss(is_correct, platt_pred)
+
+print(f"Isotonic Brier loss: {iso_error:.4f}")
+print(f"Platt Brier loss:    {platt_error:.4f}")
+
+# Example output:
+# Isotonic Brier loss: 0.1823  ← lower = better fit
+# Platt Brier loss:    0.1896  ← Platt is less flexible
+```
+
+## Key Takeaway
+
+Isotonic regression:
+1. **Learns from data**: "What's the actual accuracy when LLM says 0.68?"
+2. **No shape assumption**: Fits whatever curve the data shows (no forced sigmoid)
+3. **Piecewise-linear**: Connects calibration points with straight lines
+4. **Monotonic guarantee**: Ensures accuracy never decreases with confidence
+5. **Better fit**: Lower calibration error on the training data
+
+The cost: needs more samples (10K+) and can overfit if you're not careful.
 
 *Pointer:* [solution.md](solution.md), Section 2.3 "Confidence Calibration via Platt Scaling"
