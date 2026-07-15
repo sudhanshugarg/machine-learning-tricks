@@ -11,6 +11,28 @@ The business constraint: **minimize cost while maintaining evaluation quality**.
 
 ---
 
+## Example: RLHF Feedback Platform
+
+To make this concrete, consider **a company training a large language model** (e.g., Claude, GPT) and collecting human feedback for reinforcement learning from human feedback (RLHF).
+
+**The scenario:**
+- The model generates responses to thousands of prompts per day
+- Each response must be rated (quality, safety, instruction-following) on a 5-point scale
+- Hiring enough expert annotators to evaluate everything is prohibitively expensive (~$20M/day at current costs)
+- Using an LLM to grade responses is tempting (cheap, instant) but unreliable (gets tricked, has biases, doesn't match human judgment)
+
+**Why the hybrid system is essential:**
+- **Easy responses** (clearly good or bad): LLM grades them instantly for $0.001 per item
+- **Borderline responses** (score 2–4): Route to expert humans ($2/item) because these cases most affect model learning
+- **Validation**: Continuously measure whether LLM grades correlate with human ground truth; retrain the LLM judge if it drifts
+
+**Business impact:**
+- Cost: $0.10/item on average (vs. $2.00 if all-human)
+- Quality: Feedback used for training is as good as human-only eval (Spearman's ρ ≥ 0.85)
+- Speed: 95% of items scored within seconds (vs. 30 minutes for humans)
+
+---
+
 ## Scale Assumptions
 
 - **Throughput**: 1,000 items/second (86.4M items/day)
