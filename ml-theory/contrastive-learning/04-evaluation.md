@@ -2,7 +2,7 @@
 
 ## Overview
 
-A contrastive model is only as good as its representations. Since there is no explicit下游 task during pretraining, evaluation requires diagnostic probes that measure how **transferable** and **linearly separable** the learned features are.
+A contrastive model is only as good as its representations. Since there is no explicit downstream task during pretraining, evaluation requires diagnostic probes that measure how **transferable** and **linearly separable** the learned features are.
 
 ---
 
