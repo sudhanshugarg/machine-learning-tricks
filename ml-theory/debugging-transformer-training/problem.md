@@ -48,7 +48,6 @@ class BrokenTransformerLM(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        # Bug source 1: positional encoding
         self.pos_emb = nn.Embedding(max_len, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -67,16 +66,13 @@ class BrokenTransformerLM(nn.Module):
         b, s = x.shape
         tok = self.token_emb(x)  # [B, S, D]
 
-        # Bug source 2: positional encoding handling
         pos = torch.arange(s, device=x.device).unsqueeze(0).expand(b, s)
         pos = self.pos_emb(pos)
 
-        # Bug source 3: combining embeddings
         # Students often uncomment one or the other but not both
         # out = tok + pos
-        out = tok  # <-- BUG: positional encoding is computed but never added
+        out = tok
 
-        # Bug source 4: causal mask
         mask = None  # No causal masking!
         out = self.transformer(out, mask=mask)
 
@@ -120,10 +116,8 @@ def train():
 
     model = BrokenTransformerLM(VOCAB_SIZE).to(device)
 
-    # Bug source 5: optimizer settings
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
 
-    # Bug source 6: loss function
     criterion = nn.CrossEntropyLoss()
 
     for epoch in range(20):
@@ -133,13 +127,10 @@ def train():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
 
-            # Bug source 7: forward pass label mismatch
             logits = model(x)  # [B, S, V]
 
-            # Bug source 8: loss computation over padding / wrong reshape
             loss = criterion(logits.view(-1, VOCAB_SIZE), y.view(-1))
 
-            # Bug source 9: missing gradient zeroing
             loss.backward()
             optimizer.step()
 
