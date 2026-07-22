@@ -116,3 +116,64 @@ This is a property of $N$ and $\sigma$ acting *through the forward pass*, not th
 | $\epsilon$ | Slightly larger than the $10^{-8}$ default (e.g. $10^{-6}$) | Guards against division blow-ups if $\hat{v}_t$ is ever near zero for some parameter during the volatile early phase. |
 
 **Bottom line:** don't try to solve for $\alpha$, $\beta_1$, $\beta_2$ as functions of $N$ and $\sigma$ — Adam's per-parameter normalization already absorbs most of that. The one real consequence of $\sigma=1$ init (as opposed to properly fan-in-scaled init) is that it produces exploding forward-pass activations for any layer with meaningfully large fan-in, and the standard, well-tested fix for that is learning-rate warmup, not a change to the steady-state $\alpha$. If you have the freedom to change the init instead of just the optimizer, using $\sigma = 1/\sqrt{N_{in}}$ (or LayerNorm/BatchNorm to normalize activations directly) removes the problem at its source and makes the warmup less critical.
+
+---
+
+### Q: In scaled dot-product attention, why divide by $\sqrt{d_k}$ instead of $d_k$? If the goal is variance 1, shouldn't dividing by $d_k$ get us there?
+
+**A:** This is a variance-algebra question in disguise, and working through the algebra explicitly shows why $\sqrt{d_k}$ is exactly right and $d_k$ overshoots.
+
+(Note: the scaling in "Attention is All You Need" is by $\sqrt{d_k}$, the dimension of each **query/key vector** — equal to $d_{model}$ only in the single-head case; with $h$ heads, $d_k = d_{model}/h$. The reasoning below is identical either way, just substitute whichever dimension your $Q$ and $K$ vectors actually have.)
+
+#### Set up the assumption
+
+Assume each component of $q$ and $k$ is independently drawn with mean $0$ and variance $1$ (this is the standard init/normalization assumption the paper's argument relies on — e.g. right after a LayerNorm or a well-initialized linear projection):
+
+$$q_i, k_i \sim \text{i.i.d.}, \quad \mathbb{E}[q_i] = \mathbb{E}[k_i] = 0, \quad \text{Var}(q_i) = \text{Var}(k_i) = 1$$
+
+#### Compute the variance of the raw dot product
+
+The unscaled attention score for one query/key pair is:
+
+$$s = q \cdot k = \sum_{i=1}^{d_k} q_i k_i$$
+
+For each individual term $q_i k_i$, since $q_i$ and $k_i$ are independent and zero-mean:
+
+$$\mathbb{E}[q_i k_i] = \mathbb{E}[q_i]\,\mathbb{E}[k_i] = 0$$
+$$\text{Var}(q_i k_i) = \mathbb{E}[q_i^2 k_i^2] - \mathbb{E}[q_i k_i]^2 = \mathbb{E}[q_i^2]\,\mathbb{E}[k_i^2] - 0 = \text{Var}(q_i)\cdot\text{Var}(k_i) = 1 \cdot 1 = 1$$
+
+Since the $d_k$ terms in the sum are independent, variances add:
+
+$$\text{Var}(s) = \text{Var}\left(\sum_{i=1}^{d_k} q_i k_i\right) = \sum_{i=1}^{d_k} \text{Var}(q_i k_i) = d_k$$
+
+**So the raw dot product already has variance $d_k$, not $1$** — this is the whole reason scaling is needed in the first place. As $d_k$ grows, $s$ swings over an ever-wider range, pushing softmax inputs to large magnitudes and, per the paper, "pushing the softmax function into regions where it has extremely small gradients."
+
+#### Solve for the correct normalizer
+
+We want a constant $c$ such that $\text{Var}(s/c) = 1$. Scaling a random variable by $1/c$ scales its variance by $1/c^2$:
+
+$$\text{Var}\left(\frac{s}{c}\right) = \frac{\text{Var}(s)}{c^2} = \frac{d_k}{c^2}$$
+
+Setting this equal to $1$:
+
+$$\frac{d_k}{c^2} = 1 \implies c^2 = d_k \implies c = \sqrt{d_k}$$
+
+That's the derivation — dividing by $\sqrt{d_k}$ is not a rule of thumb, it falls directly out of the fact that **variance scales with $c^2$, not $c$**, when you rescale a random variable by $1/c$.
+
+#### Why dividing by $d_k$ overshoots
+
+If you divided by $d_k$ instead (i.e. $c = d_k$):
+
+$$\text{Var}\left(\frac{s}{d_k}\right) = \frac{d_k}{d_k^2} = \frac{1}{d_k}$$
+
+For any reasonably large $d_k$ (64, 128, ...), this variance collapses toward $0$. The scores for every key would become nearly identical near-zero values regardless of how relevant each key actually is to the query — softmax over near-constant logits produces an almost uniform attention distribution. You'd trade one failure mode (softmax saturation from scores that are too large) for a different one (a mechanism that can't discriminate between keys because the scores are too small to carry signal) — and it gets strictly worse as $d_k$ grows, since $1/d_k \to 0$ while the "just right" scaling by $\sqrt{d_k}$ keeps variance pinned at exactly $1$ for any $d_k$.
+
+#### Summary
+
+| Scaling | Resulting $\text{Var}(s)$ | Effect as $d_k$ grows |
+|---|---|---|
+| None (divide by 1) | $d_k$ | Grows unboundedly — softmax saturates, gradients vanish |
+| Divide by $d_k$ | $1/d_k$ | Shrinks toward 0 — softmax becomes near-uniform, loses discriminative signal |
+| Divide by $\sqrt{d_k}$ | $1$ | Stays constant — softmax operates in a well-conditioned regime regardless of head/model dimension |
+
+The general rule this generalizes to: if you sum $n$ independent, mean-zero, unit-variance terms, the sum has variance $n$ and standard deviation $\sqrt{n}$ — so restoring unit variance always means dividing by $\sqrt{n}$, not $n$. This is the same $\sqrt{n}$ that shows up in the Central Limit Theorem's normalization and in Xavier/He weight initialization for exactly this reason.
