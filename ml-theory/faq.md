@@ -270,3 +270,28 @@ In this idealized i.i.d.-noise simulation, most of the variance reduction is act
 - **Bias correction** fixes a systematic, deterministic bias ($m_0=v_0=0$ pulling early estimates toward zero) — it's necessary, but even working perfectly it still leaves the first update at a full, high-confidence $\alpha$-sized step based on very few samples.
 - **Warmup** fixes the complementary problem: the *variance* of that early estimate is enormous, so it directly throttles $\alpha$ itself during the window where $\hat m_t, \hat v_t$ can't yet be trusted, independent of what Adam's internal math computes.
 - Yes, both are still needed for roughly the first several hundred to ~1000 steps even with bias correction fully applied — they solve different halves of the same "Adam is overconfident early in training" problem.
+
+---
+
+### Q: As training progresses, is it expected that the weight norm of self-attention matrices goes up?
+
+**A:** Yes — this is a widely observed and, to a first approximation, expected phenomenon, and it's driven by more than one mechanism at once. It's also not automatically "fine": unconstrained norm growth in $W_Q, W_K$ specifically is a documented cause of training instability at scale, which is why techniques like QK-norm and weight decay exist to keep it in check.
+
+#### Mechanism 1: nothing is pulling the weights back toward zero
+
+Gradient descent only ever moves weights in the direction that reduces the loss. Without an explicit regularizer, there is no restoring force pulling $\|W\|$ back down — so any net-beneficial direction of movement simply accumulates over thousands of steps. Contrast this with $L_2$/weight decay (see the [Momentum/RMSprop/Adam/AdamW entry](#q-whats-the-difference-between-rmsprop-momentum-adam-and-adamw) above): $-\lambda\theta_t$ is precisely a restoring force toward the origin, added to counteract exactly this drift. Without it (or with it too weak), norms have nowhere to go but up on average.
+
+#### Mechanism 2: sharper attention requires larger QK norms
+
+This one is specific to self-attention. Recall from the [$\sqrt{d_k}$ scaling entry](#q-in-scaled-dot-product-attention-why-divide-by-sqrtd_k-instead-of-d_k-if-the-goal-is-variance-1-shouldnt-dividing-by-d_k-get-us-there) above: the attention logits are $s = q\cdot k / \sqrt{d_k}$, and the *magnitude* of $s$ directly controls how peaked or flat the softmax distribution is. Early in training, $W_Q, W_K$ are small and near-random, so logits are small and attention is close to uniform (the model attends "a little to everything"). As training proceeds, many heads need to learn a sharp, confident routing — e.g. "the current token should attend almost entirely to the matching opening bracket" — and the only way softmax can produce a near-one-hot distribution is if the underlying logits have large magnitude. Since $s$ scales with $\|W_Q\|\cdot\|W_K\|$ (roughly), **the model has a direct incentive to grow the norms of its query/key projections in order to sharpen attention**, and gradient descent will happily do this because it reduces the loss. This is a real, task-driven reason for growth — not just random drift.
+
+#### Why this isn't automatically harmless
+
+Unbounded logit/norm growth is specifically identified in the literature as a source of instability at scale, under the name **attention entropy collapse**: if $\|W_Q\|, \|W_K\|$ grow without bound, attention logits keep growing, softmax keeps sharpening, and at some point a small number of heads collapse to attending almost entirely to one token (entropy $\to 0$). Once a head is in that regime, its gradients through softmax become tiny (the classic softmax-saturation problem from the $\sqrt{d_k}$-scaling discussion, except now caused by *learned* weight growth rather than *initialization* scale) — and in mixed-precision training this compounds with numerical range issues, producing the loss spikes/divergence sometimes seen in large transformer training runs. This is the motivation behind:
+- **QK-norm** (normalizing $q$ and $k$, e.g. with a LayerNorm or L2-normalize-and-rescale, before computing $q\cdot k$) — used in ViT-22B, Gemma 2, and several other large-scale transformer training recipes specifically to decouple "how sharp attention is" from "how large the weight norms happen to have grown."
+- **Weight decay** (via AdamW) — directly counteracts Mechanism 1, and in practice also caps how far Mechanism 2 can run before the decay term pushes back.
+- **Learning-rate decay schedules** — as $\alpha \to 0$ near the end of training, both the useful growth (Mechanism 2) and the undirected drift (Mechanism 1) naturally slow down and the norm tends to plateau rather than diverge.
+
+#### Bottom line
+
+Some weight-norm growth in attention projections during training is expected and often even useful (it's how the model learns to sharpen attention where sharp routing helps). What's *not* expected/healthy is *unbounded* growth — a well-tuned training setup (adequate weight decay, LR decay, and at large scale often QK-norm) should show norm growth that decelerates and plateaus rather than growing without bound for the whole run. If you observe attention weight norms climbing steadily for the entire training run with no sign of leveling off, that's often a signal to check weight decay strength, consider QK-norm, or check whether a few heads have collapsed into the entropy-collapse regime described above.
