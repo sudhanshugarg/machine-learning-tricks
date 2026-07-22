@@ -177,3 +177,96 @@ For any reasonably large $d_k$ (64, 128, ...), this variance collapses toward $0
 | Divide by $\sqrt{d_k}$ | $1$ | Stays constant — softmax operates in a well-conditioned regime regardless of head/model dimension |
 
 The general rule this generalizes to: if you sum $n$ independent, mean-zero, unit-variance terms, the sum has variance $n$ and standard deviation $\sqrt{n}$ — so restoring unit variance always means dividing by $\sqrt{n}$, not $n$. This is the same $\sqrt{n}$ that shows up in the Central Limit Theorem's normalization and in Xavier/He weight initialization for exactly this reason.
+
+---
+
+### Q: Why does Adam need a warmup scheduler like this one, and does bias correction make it unnecessary?
+
+```python
+# Warmup scheduler
+def get_lr(step, warmup_steps, max_lr):
+    if step < warmup_steps:
+        return max_lr * (step / warmup_steps)
+    return max_lr
+```
+
+**A:** Bias correction and warmup fix two *different* problems. Bias correction removes a deterministic bias in the moving-average estimates; warmup compensates for those estimates having very high variance (i.e., being unreliable/noisy point estimates) while they're based on only a handful of samples. Both matter, and one doesn't substitute for the other. Working through the actual numbers at $\alpha = 10^{-2}$ makes this concrete.
+
+#### What bias correction does — and what it deliberately doesn't do
+
+Recall Adam's moving averages, initialized at $m_0 = v_0 = 0$:
+
+$$m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t, \qquad v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2$$
+$$\hat{m}_t = \frac{m_t}{1-\beta_1^t}, \qquad \hat{v}_t = \frac{v_t}{1-\beta_2^t}$$
+
+At $t=1$: $m_1 = (1-\beta_1) g_1$ and $v_1 = (1-\beta_2) g_1^2$. Bias correction divides each by its own $(1-\beta^t)$ factor, which for $t=1$ exactly cancels the $(1-\beta_1)$/$(1-\beta_2)$ multiplier:
+
+$$\hat{m}_1 = \frac{(1-\beta_1)g_1}{1-\beta_1} = g_1, \qquad \hat{v}_1 = \frac{(1-\beta_2)g_1^2}{1-\beta_2} = g_1^2$$
+
+$$\Rightarrow \quad \frac{\hat{m}_1}{\sqrt{\hat{v}_1}} = \frac{g_1}{\sqrt{g_1^2}} = \text{sign}(g_1)$$
+
+**This is the crux of the problem: after bias correction, the very first update is always exactly $\pm\alpha$ — full step size — regardless of how large, small, or noisy that one single gradient sample was.** Bias correction is doing its job correctly (it's removing the deterministic shrink-toward-zero bias from $m_0=v_0=0$), but "correctly unbiased" and "reliable" are not the same thing: an unbiased estimate built from a sample size of 1 is still an extremely noisy estimate. The ratio $\hat m_t/\sqrt{\hat v_t}$ behaves almost like sign-SGD in these first few steps — full-confidence, fixed-size steps taken in whatever direction a single stochastic minibatch gradient happened to point.
+
+#### Numeric example: a concrete gradient path, $\alpha = 10^{-2}$, no warmup
+
+Take an illustrative early-training gradient sequence $g_1, ..., g_5 = 3.7, -0.2, 0.05, 1.9, -0.01$ (typical of the erratic, large-magnitude gradients seen right after random init), with $\beta_1=0.9$, $\beta_2=0.999$:
+
+| $t$ | $g_t$ | $\hat m_t$ | $\hat v_t$ | ratio $\hat m_t/\sqrt{\hat v_t}$ | update $= \alpha \cdot$ ratio |
+|---|---|---|---|---|---|
+| 1 | 3.7000 | 3.7000 | 13.6900 | 1.0000 | 0.010000 |
+| 2 | −0.2000 | 1.6474 | 6.8616 | 0.6289 | 0.006289 |
+| 3 | 0.0500 | 1.0579 | 4.5729 | 0.4947 | 0.004947 |
+| 4 | 1.9000 | 1.3028 | 4.3318 | 0.6259 | 0.006259 |
+| 5 | −0.0100 | 0.9822 | 3.4638 | 0.5278 | 0.005278 |
+
+Notice step 1's update is pinned at exactly $\alpha = 0.01$ — the theoretical result above holding exactly. Steps 2–5 drift a bit below $\alpha$ as $\hat v_t$ starts to accumulate more than one sample, but they're still all within roughly $\pm 40\%$ of full step size, taken on the strength of 2–5 gradient samples. If $\alpha=10^{-2}$ is already a fairly aggressive peak learning rate for Adam (the common default is $10^{-3}$), taking near-full-sized steps on 1–5 noisy samples is exactly the kind of instability (loss spikes, occasional divergence) that's empirically observed when training without warmup.
+
+**Without bias correction at all**, this is actually *worse*, not better — recomputing the same path with raw (uncorrected) $m_t, v_t$:
+
+| $t$ | ratio $m_t/\sqrt{v_t}$ (no correction) |
+|---|---|
+| 1 | 3.1623 |
+| 2 | 2.6725 |
+| 3 | 2.4490 |
+| 4 | 3.4062 |
+| 5 | 3.0595 |
+
+Without correction the step-1 ratio is $3.16\times$ larger than with correction, because $\sqrt{1-\beta_2^t}$ shrinks slower than $(1-\beta_1^t)$ for small $t$ (since $\beta_2 \gg \beta_1$), so the uncorrected denominator $\sqrt{v_t}$ is disproportionately tiny relative to the numerator $m_t$. **So bias correction is still necessary — it tames an even larger initial overshoot ($3.16\alpha \to \alpha$) — it just doesn't tame it enough.** Even at its best (fully corrected), the first update is still a full $\alpha$-sized, high-confidence step based on a single noisy sample.
+
+#### Same path, with the warmup scheduler applied
+
+Plugging the same ratios into `get_lr(step, warmup_steps=1000, max_lr=1e-2)`:
+
+| $t$ | ratio | $\text{lr}(t) = \alpha \cdot t/1000$ | update $= \text{lr}(t)\cdot$ratio |
+|---|---|---|---|
+| 1 | 1.0000 | 0.000010 | 0.00001000 |
+| 2 | 0.6289 | 0.000020 | 0.00001258 |
+| 3 | 0.4947 | 0.000030 | 0.00001484 |
+| 4 | 0.6259 | 0.000040 | 0.00002504 |
+| 5 | 0.5278 | 0.000050 | 0.00002639 |
+
+Warmup shrinks step 1's update from $0.01$ down to $0.00001$ — three orders of magnitude smaller. It does this by throttling $\alpha$ itself, directly, from outside Adam's own math — it doesn't try to fix or second-guess $\hat m_t, \hat v_t$; it just makes sure that *however* confident (and however wrong) Adam's early ratio is, the actual parameter movement stays small until the moving averages have had enough samples to mean something.
+
+#### Does the noise/variance problem really last ~1000 steps?
+
+Simulating this directly makes the picture precise. Take a stationary, mean-zero gradient ($g_t \sim \mathcal{N}(0,1)$ i.i.d. — pure noise, the hardest case to estimate from) and measure the variance of the bias-corrected ratio $\hat m_t/\sqrt{\hat v_t}$ across 20,000 independent trials at several checkpoints:
+
+| $t$ | std(ratio) |
+|---|---|
+| 1 | 1.0000 |
+| 5 | 0.4531 |
+| 20 | 0.2577 |
+| 100 | 0.2290 |
+| 300 | 0.2299 |
+| 1000 | 0.2272 |
+| 2000 | 0.2291 |
+
+At $t=1$, the ratio is *always* exactly $\pm 1$ (std $=1.0$) — total confidence from a single sample, as derived above. The variance drops sharply over the first ~100–300 steps and then plateaus at a steady-state value (~0.23) that persists indefinitely — Adam's moving averages have a finite effective memory (they're exponential, not cumulative, averages), so their estimate never becomes "fully converged," it just reaches a stable noise floor.
+
+In this idealized i.i.d.-noise simulation, most of the variance reduction is actually done well before 1000 steps. The reason $1000 \approx 1/(1-\beta_2)$ shows up as a common warmup-length heuristic anyway is that it's the *characteristic timescale* of the $v_t$ exponential moving average (the point at which a sample's weight has decayed to $\approx 37\%$), which is a convenient, easy-to-reason-about proxy — not a hard cutoff. Real early training also has non-stationarity this toy simulation doesn't capture (the gradient distribution itself is shifting rapidly right after a bad random init, not just being noisily estimated around a fixed value), which is why practitioners tune warmup length empirically rather than deriving it exactly from this variance argument alone.
+
+#### Bottom line
+
+- **Bias correction** fixes a systematic, deterministic bias ($m_0=v_0=0$ pulling early estimates toward zero) — it's necessary, but even working perfectly it still leaves the first update at a full, high-confidence $\alpha$-sized step based on very few samples.
+- **Warmup** fixes the complementary problem: the *variance* of that early estimate is enormous, so it directly throttles $\alpha$ itself during the window where $\hat m_t, \hat v_t$ can't yet be trusted, independent of what Adam's internal math computes.
+- Yes, both are still needed for roughly the first several hundred to ~1000 steps even with bias correction fully applied — they solve different halves of the same "Adam is overconfident early in training" problem.
