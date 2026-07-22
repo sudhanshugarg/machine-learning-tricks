@@ -23,6 +23,7 @@ class TwoTowerModel(nn.Module):
 
         self.user_tower = nn.Sequential(
             nn.Linear(32, 128, bias=False),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(p=0.2),
             nn.Linear(128, 32)
@@ -30,6 +31,7 @@ class TwoTowerModel(nn.Module):
 
         self.video_tower = nn.Sequential(
             nn.Linear(32, 128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(p=0.2),
             nn.Linear(128, 32)
