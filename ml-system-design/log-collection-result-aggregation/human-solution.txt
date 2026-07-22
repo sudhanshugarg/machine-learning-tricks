@@ -1,0 +1,8 @@
+Q: build a system that collects logs from large-scale autonomous-driving simulations and aggregates them into evaluation metrics. Cross-cutting follow-up: how do you reconcile the abundance of simulation data against the relative scarcity of real-world fleet data?
+
+
+Requirements: Functional
+ - Have > N Simulation Logs per day
+ - Have enough information in them, so that we can convert into metrics
+ - Can use real - world data as seed data to generate simulated data. (over sampling / SMOTE - synthetic minority over sampling technique)
+ - 
