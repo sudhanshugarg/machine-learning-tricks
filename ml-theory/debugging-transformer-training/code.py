@@ -1,21 +1,3 @@
-# Debugging a Transformer That Won't Learn
-
-## The Scenario
-
-You are training a small **decoder-only (GPT-style) transformer** for next-token prediction on a TinyShakespeare-style excerpt. Positional encoding, causal masking, `zero_grad()`, and LR warmup are all already wired up correctly this time — but training loss still plateaus around 2.7–3.8 after several epochs, and the per-layer gradient norms you print after every epoch look suspicious.
-
-Your task:
-1. **Diagnose** what is preventing the model from learning a proper language model.
-2. **Explain** the root cause of each bug using ML theory (attention dynamics, information flow in autoregressive models, Adam optimization theory, backpropagation through deep stacks, etc.).
-3. **Fix** the code and verify the model learns a coherent next-token prediction objective.
-
-You are allowed to run the code, inspect attention maps, print gradient norms, and add debugging instrumentation. Treat this as a real debugging session.
-
----
-
-## The Buggy Code
-
-```python
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,10 +50,14 @@ class BrokenTransformerLM(nn.Module):
         b, s = x.shape
         tok = self.token_emb(x)  # [B, S, D]
 
+        # pos = torch.arange(s, device=x.device).unsqueeze(0).expand(b, s)
+        # print(pos.shape)
         pos = torch.arange(s, device=x.device)
         pos = self.pos_emb(pos)
 
+        # Students often uncomment one or the other but not both
         out = tok + pos
+        # out = tok
 
         mask = torch.triu(torch.ones(s, s, dtype=torch.bool, device=x.device), diagonal=1)
         out = self.transformer(out, mask=mask, is_causal=True)
@@ -99,6 +85,7 @@ class CharDataset(Dataset):
 
 
 def warmup_scheduler(step: int) -> float:
+    # print(f"step = {step}")
     if step < BrokenTransformerLM.WARMUP_MAX_STEPS:
         return float(step / BrokenTransformerLM.WARMUP_MAX_STEPS)
     else:
@@ -175,42 +162,3 @@ def train():
 
 if __name__ == "__main__":
     train()
-```
-
----
-
-## Your Task
-
-1. **Run the code** (or mentally trace it). Is loss decreasing at a reasonable rate? Inspect the per-layer gradient norms printed after each epoch — do they look uniform across depth, or is there a pattern?
-2. **Systematically debug**. For each suspected issue:
-   - What is the theoretical reason it breaks learning in a transformer?
-   - What empirical evidence (attention maps, gradient norms, generated text) would confirm it?
-   - What is the fix?
-3. **Produce a corrected version** that produces coherent completions from the prompt `"women and men "` and reaches training loss < 1.0 within 20 epochs on this toy dataset.
-
----
-
-## Open-Ended Discussion Questions
-
-After fixing the code, consider these:
-
-1. **Vanishing Gradients in Deep Stacks**: The printed gradient norms grow substantially from `token_emb.weight` up through `transformer.layers.7`. Using the chain rule and the derivative of the sigmoid function, explain why stacking many layers that each squash their output through a saturating activation causes gradients to shrink geometrically with depth. Why does the choice of Post-LN (`norm_first=False`, the `nn.TransformerEncoderLayer` default) make this worse rather than better?
-
-2. **Causal Masking Theory**: In an autoregressive model, each position can only attend to previous positions. If you remove the causal mask during training but keep it during inference, why does the model fail at generation even though training loss was low? Use the concept of **distribution shift** and **exposure bias** to explain.
-
-3. **Positional Encoding**: Why can a transformer (without recurrence or convolution) not distinguish `"ab"` from `"ba"` if positional encodings are removed? Explain using the permutation-invariance of self-attention.
-
-4. **Adam Warmup**: Transformers are almost universally trained with a learning-rate warmup. Explain the theoretical reason: what happens to the second-moment estimates ($v_t$ in Adam) in the first few steps if you start with a large LR? How does this cause early training instability?
-
-5. **Label Shifting for LM**: In next-token prediction, the input at position $i$ predicts the token at position $i+1$. If you instead train the model to predict the token at position $i$ from itself (no shift), what is the theoretical maximum cross-entropy loss the model can achieve, and why does this represent a trivial solution?
-
-6. **Attention Pattern Debugging**: If generation still produces repetitive loops (e.g., `"the the the the..."`), what attention-pattern pathology would you look for? How would you diagnose it by inspecting attention weights?
-
----
-
-## Deliverables
-
-- A list of **all bugs** you found, ranked by severity.
-- A **brief theoretical explanation** for why each bug kills learning in a transformer.
-- **Empirical evidence** used to confirm each bug (prints, attention visualizations, generated text).
-- The **fully corrected code** with comments marking each fix.
