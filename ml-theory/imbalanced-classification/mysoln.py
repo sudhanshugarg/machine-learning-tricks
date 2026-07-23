@@ -75,13 +75,13 @@ class FraudModel(nn.Module):
         """
         x0 is category
         """
-        print("x.shape: ", x.shape)
-        print("x[:, 0].shape: ", x[:, 0].to(torch.long).shape)
+        # print("x.shape: ", x.shape)
+        # print("x[:, 0].shape: ", x[:, 0].to(torch.long).shape)
         category_embedding = self.category(x[:, 0].to(torch.long)) #b, 4
         currency_embedding = self.currency(x[:, 1].to(torch.long))
         country_embedding = self.country(x[:, 2].to(torch.long))
         user_id_embedding = self.user_ids(x[:, 3].to(torch.long))
-        print("user_id_embedding.shape: ", user_id_embedding.shape)
+        # print("user_id_embedding.shape: ", user_id_embedding.shape)
 
         remaining_embedding = x[:, 4:]
         input = torch.cat([category_embedding, currency_embedding, country_embedding, user_id_embedding, remaining_embedding], dim=1)
@@ -110,12 +110,12 @@ class FraudDataset(Dataset):
         user_ids = torch.randint(low=0, high=FraudModel.MAX_USER_ID, size=(self.n, 1))
         other_features = torch.rand((self.n, 3)) * 10
         self.x = torch.cat([categories, currencies, countries, user_ids, other_features], dim=1)
-        print(self.x.shape)
+        # print(self.x.shape)
         pos_fraction = 1e-3
         pos_count = math.floor(pos_fraction * self.n)
         neg_count = self.n - pos_count
         self.y = torch.cat([torch.zeros(neg_count), torch.ones(pos_count)])
-        print(self.y.shape)
+        # print(self.y.shape)
 
     def __getitem__(self, idx: int):
         return self.x[idx], self.y[idx]
@@ -137,7 +137,7 @@ def train():
     fraud_dataset = FraudDataset()
     loader = DataLoader(fraud_dataset, batch_size=32, shuffle=True)
 
-    epochs = 1
+    epochs = 2
     for i in range(epochs):
         epoch_loss = 0.0
         for batch_idx, (x, y) in enumerate(loader):
@@ -149,6 +149,9 @@ def train():
             optimizer.step()
             scheduler.step()
 
+            if batch_idx % 500 == 1:
+                avg_loss = epoch_loss / (batch_idx + 1)
+                print(f"epoch: {i}, batch: {batch_idx}, loss = {avg_loss}")
         avg_epoch_loss = epoch_loss / len(loader)
         print(f"epoch: {i}, loss = {avg_epoch_loss}")
 
